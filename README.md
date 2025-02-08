@@ -55,7 +55,7 @@ Linux
 
 - 1.Copy FemtoBoltUpgrader.exe to the Release/linux directory
 - 2.Open the terminal in the linux directory
-- 3. in Release/linux directory ,Enter
+- 3.in Release/linux directory ,Enter
  ```bash
      chmod +x usbdownload
 ```
