@@ -26,13 +26,13 @@ Firmware download link for femto bolt：[Femto Bolt Firmware](https://github.com
 windows
 
 ``` powershell
-cd FemtoBoltUpgrade && mkdir build && cd build && cmake .. && cmake --build . --config Release
+ mkdir build && cd build && cmake .. && cmake --build . --config Release
 ```
 
 Linux
 
 ```bash
-cd FemtoBoltUpgrade && mkdir build && cd build && cmake .. && cmake --build . --config Release
+ mkdir build && cd build && cmake .. && cmake --build . --config Release
 ```
 
 ## Usage
