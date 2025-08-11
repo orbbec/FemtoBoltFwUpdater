@@ -10,6 +10,8 @@
 #include <future>
 #include <set>
 #include <vector>
+#include <atomic>
+#include <queue>
 
 #ifdef WIN32
 #include <conio.h>
@@ -35,19 +37,55 @@ void handleDeviceDisconnected(std::shared_ptr<ob::DeviceList> disconnectList);
 void upgradeDevices(std::string filePath);
 void printDevicesInfo();
 
+bool isAutoMode = false;
+std::atomic<bool> shouldExitAuto{false};
+std::queue<char> autoInputQueue;
+std::mutex autoInputQueueMutex;
+std::thread autoInputThread;
+
+void waitForAutoInput() {
+    char input;
+    while (!shouldExitAuto && std::cin.get(input)) {
+        std::lock_guard<std::mutex> lock(autoInputQueueMutex);
+        autoInputQueue.push(input);
+        if(input == 'q' || input == 'Q') {
+            break;
+        }
+    }
+}
+
+bool hasAutoInput() {
+    std::lock_guard<std::mutex> lock(autoInputQueueMutex);
+    return !autoInputQueue.empty();
+}
+
+char getAutoInput() {
+    std::lock_guard<std::mutex> lock(autoInputQueueMutex);
+    if (autoInputQueue.empty()) return 0;
+    char c = autoInputQueue.front();
+    autoInputQueue.pop();
+    return c;
+}
+
 int main(int argc, char **argv)
 try
 {
 
-    if (argc != 2)
+    if (argc < 2 || argc > 3)
     {
-        std::cerr << "Usage:[app] [firmware path]" << std::endl;
+        std::cerr << "Usage:[app] [firmware path] [--auto]" << std::endl;
         return -1;
     }
 
     std::string filePath = std::string(argv[1]);
     // create context
     ob::Context ctx;
+
+    if(argc == 3 && std::string(argv[2]) == "--auto") {
+        isAutoMode = true;
+        std::cout << "Running in automation mode - reading commands from stdin" << std::endl;
+        autoInputThread = std::thread(waitForAutoInput);
+    }
 
     // register device callback
     ctx.setDeviceChangedCallback([](std::shared_ptr<ob::DeviceList> removedList, std::shared_ptr<ob::DeviceList> addedList)
@@ -60,25 +98,42 @@ try
 
     while (true)
     {
-        if (kbhit())
-        {
-            int key = getch();
+        bool keyPressed = false;
+        int key = 0;
+        if (isAutoMode) {
+            if (hasAutoInput()) {
+                key = getAutoInput();
+                keyPressed = true;
+            }
+        } else {
+            // Check for keyboard input
+            if (kbhit()) {
+                key = getch();
+                keyPressed = true;
+            }
+        }
 
+        if (keyPressed) 
+        {
             // Press the esc key to exit
-            if (key == ESC)
+            if (key == ESC || key == 'q' || key == 'Q')
             {
                 break;
             }
-
             if (key == 'u' || key == 'U')
             {
                 upgradeDevices(filePath);
             }
         }
-        else
+        else     
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
+    }
+
+    shouldExitAuto = true;
+    if(autoInputThread.joinable()) {
+        autoInputThread.join();
     }
 
     return 0;
@@ -86,6 +141,12 @@ try
 catch (ob::Error &e)
 {
     std::cerr << "function:" << e.getName() << "\nargs:" << e.getArgs() << "\nmessage:" << e.getMessage() << "\ntype:" << e.getExceptionType() << std::endl;
+
+    shouldExitAuto = true;
+    if(autoInputThread.joinable()) {
+        autoInputThread.join();
+    }
+    
     exit(EXIT_FAILURE);
 }
 

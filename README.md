@@ -62,10 +62,12 @@ Linux
 - 4.Enter the following command:
 
 ```bash
- .\FemtoBoltUpgrader  path(Directory to upgrade firmware)
+ .\FemtoBoltUpgrader  path(Directory to upgrade firmware) [--auto]
 ```
+(For automation mode - without input keystrokes, add the --auto flag)
 
-- 4.Wait a moment, then type U or u to start the upgrade, or Esc to exit the upgrade
+- 4.Wait a moment, then type U or u to start the upgrade, or Esc (q or Q for auto mode) to exit the upgrade
+
 
 ## Code Description
 
