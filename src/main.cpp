@@ -61,7 +61,9 @@ bool hasAutoInput() {
 
 char getAutoInput() {
     std::lock_guard<std::mutex> lock(autoInputQueueMutex);
-    if (autoInputQueue.empty()) return 0;
+    if (autoInputQueue.empty()) {
+        return 0;
+    } 
     char c = autoInputQueue.front();
     autoInputQueue.pop();
     return c;
@@ -81,6 +83,7 @@ try
     if (argc < 2 || argc > 3)
     {
         std::cerr << "Usage:[app] [firmware path] [--auto]" << std::endl;
+        std::cerr << "Note: --auto must be the final argument when used" << std::endl;
         return -1;
     }
 
