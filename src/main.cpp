@@ -67,6 +67,13 @@ char getAutoInput() {
     return c;
 }
 
+void endWaitForInput() {
+    shouldExitAuto = true;
+    if(autoInputThread.joinable()) {
+        autoInputThread.join();
+    }
+}
+
 int main(int argc, char **argv)
 try
 {
@@ -100,17 +107,12 @@ try
     {
         bool keyPressed = false;
         int key = 0;
-        if (isAutoMode) {
-            if (hasAutoInput()) {
-                key = getAutoInput();
-                keyPressed = true;
-            }
-        } else {
-            // Check for keyboard input
-            if (kbhit()) {
-                key = getch();
-                keyPressed = true;
-            }
+        if (isAutoMode && hasAutoInput()) {
+            key = getAutoInput();
+            keyPressed = true;
+        } else if (kbhit()) {
+            key = getch();
+            keyPressed = true;
         }
 
         if (keyPressed) 
@@ -131,10 +133,7 @@ try
         }
     }
 
-    shouldExitAuto = true;
-    if(autoInputThread.joinable()) {
-        autoInputThread.join();
-    }
+    endWaitForInput();
 
     return 0;
 }
@@ -142,10 +141,7 @@ catch (ob::Error &e)
 {
     std::cerr << "function:" << e.getName() << "\nargs:" << e.getArgs() << "\nmessage:" << e.getMessage() << "\ntype:" << e.getExceptionType() << std::endl;
 
-    shouldExitAuto = true;
-    if(autoInputThread.joinable()) {
-        autoInputThread.join();
-    }
+    endWaitForInput();
     
     exit(EXIT_FAILURE);
 }
