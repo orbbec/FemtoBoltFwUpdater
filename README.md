@@ -80,7 +80,7 @@ ob::Context ctx;
 // register device callback
 ctx.setDeviceChangedCallback([](std::shared_ptr<ob::DeviceList> removedList, std::shared_ptr<ob::DeviceList> addedList){
     handleDeviceDisconnected(removedList);
-    handleDeviceConnected(addedList); 
+    handleDeviceConnected(addedList);
     });
 
 // handle current connected devices.
@@ -144,7 +144,7 @@ Upgrade devices on Windows
             // Construct the command line for firmware upgrade
             //USBDownloadTool.exe "<file_path>" <disk_number>
             std::string cmd = "USBDownloadTool.exe \"" + filePath + "\"" + " " + std::to_string(diskNumber);
-            
+
             // Create a future object for an asynchronous task
             std::future<void> cmdFuture;
             if (!cmdFuture.valid())
@@ -153,7 +153,7 @@ Upgrade devices on Windows
                 cmdFuture = std::async(std::launch::async, [cmd, diskNumber]()
                                     {
                     uint64_t startTimestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-                    
+
                     // Execute an external command and read its output
                     FILE *pipe               = NULL;
                     pipe = _popen(cmd.c_str(), "r");
@@ -172,11 +172,11 @@ Upgrade devices on Windows
 
                     // Close the pipe and calculate the end time
                     _pclose(pipe);
-                    
+
                     uint64_t endTimestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
                     float    costTime       = (endTimestamp - startTimestamp) / 1000.0;
                     std::cout << "Firmware Upgrade cost time(s):" << costTime << std::endl;
-                    
+
                     upgradedDeviceSet.erase(diskNumber); });
             }
         }
@@ -189,7 +189,7 @@ Upgrade devices on Windows
 
         // If no device is found, sleep for 500 milliseconds before trying again
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }          
+    }
 ```
 
 This code segment uses a loop to continuously check for a device and upgrade its firmware. It first finds the device and retrieves its handle, state, and disk number. Then, it checks if the device is found and not in the upgraded set. If conditions are met, the device is added to the upgraded set and a command line(/USBDownloadTool.exe <file_path> <disk_number>) for firmware upgrade is constructed. A future object is created for an asynchronous task that executes the command line and reads its output. If the future object is invalid, a new asynchronous task is created. The task reads the output of the command line.
@@ -267,13 +267,10 @@ for (const auto &path : devicePaths)
             pclose(pipe);
             uint64_t endTimestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
             float    costTime       = (endTimestamp - startTimestamp) / 1000.0;
-            std::cout << "Firmware Upgrade cost time(s):" << costTime << std::endl; 
+            std::cout << "Firmware Upgrade cost time(s):" << costTime << std::endl;
         });
     }
 }
 ```
 
 This code first waits for all devices to boot into recovery mode by using a loop and sleeping for a specific period. It then opens the /dev/ directory to find all devices that start with the prefix sg (typically SCSI generic devices), collects their paths into a vector, and performs a firmware upgrade for each device path. The upgrade is executed in an asynchronous task, which records the start and end times to calculate and print the total time taken for the firmware upgrade.
-
-
-
