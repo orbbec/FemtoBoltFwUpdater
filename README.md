@@ -46,7 +46,7 @@ windows
 - 3.Enter the following command:
 
 ``` powershell
-.\FemtoBoltUpgrader.exe  path(Directory to upgrade firmware)
+.\FemtoBoltUpgrader.exe  path/to/firmware/directory
 ```
 
 - 4.Wait a moment, then type U or u to start the upgrade, or Esc to exit the upgrade
@@ -62,7 +62,7 @@ Linux
 - 4.Enter the following command:
 
 ```bash
- .\FemtoBoltUpgrader  path(Directory to upgrade firmware)
+ ./FemtoBoltUpgrader  path/to/firmware/directory
 ```
 
 - 4.Wait a moment, then type U or u to start the upgrade, or Esc to exit the upgrade
