@@ -17,6 +17,7 @@
 #include <conio.h>
 #else
 #include <dirent.h>
+#include <poll.h>
 #endif
 
 #define ESC 27
@@ -31,6 +32,9 @@ typedef struct PipelineHolder_t
 std::recursive_mutex pipelineHolderMutex;
 std::map<std::string, std::shared_ptr<PipelineHolder>> pipelineHolderMap;
 std::set<int> upgradedDeviceSet;
+std::mutex upgradeFuturesMutex;
+std::vector<std::future<void>> upgradeFutures;
+std::atomic<bool> upgradeInProgress{false};
 
 void handleDeviceConnected(std::shared_ptr<ob::DeviceList> connectList);
 void handleDeviceDisconnected(std::shared_ptr<ob::DeviceList> disconnectList);
@@ -44,14 +48,33 @@ std::mutex autoInputQueueMutex;
 std::thread autoInputThread;
 
 void waitForAutoInput() {
+#ifdef WIN32
     char input;
     while (!shouldExitAuto && std::cin.get(input)) {
         std::lock_guard<std::mutex> lock(autoInputQueueMutex);
         autoInputQueue.push(input);
-        if(input == 'q' || input == 'Q') {
-            break;
-        }
     }
+#else
+    struct pollfd pfd;
+    pfd.fd = STDIN_FILENO;
+    pfd.events = POLLIN;
+
+    while (!shouldExitAuto) {
+        int ret = poll(&pfd, 1, 500); // 500ms timeout to check shouldExitAuto
+        if (ret > 0 && (pfd.revents & POLLIN)) {
+            char input;
+            ssize_t n = read(STDIN_FILENO, &input, 1);
+            if (n <= 0) {
+                break; // EOF or error
+            }
+            std::lock_guard<std::mutex> lock(autoInputQueueMutex);
+            autoInputQueue.push(input);
+        } else if (ret < 0) {
+            break; // poll error
+        }
+        // ret == 0 means timeout, loop back and check shouldExitAuto
+    }
+#endif
 }
 
 bool hasAutoInput() {
@@ -67,6 +90,26 @@ char getAutoInput() {
     char c = autoInputQueue.front();
     autoInputQueue.pop();
     return c;
+}
+
+void drainAutoInput() {
+    std::lock_guard<std::mutex> lock(autoInputQueueMutex);
+    while (!autoInputQueue.empty()) {
+        autoInputQueue.pop();
+    }
+}
+
+void waitForUpgradesToComplete() {
+    std::lock_guard<std::mutex> lock(upgradeFuturesMutex);
+    for (auto &f : upgradeFutures) {
+        if (f.valid()) {
+            std::cout << "Waiting for firmware upgrade to complete..." << std::endl;
+            f.get();
+        }
+    }
+    upgradeFutures.clear();
+    upgradeInProgress = false;
+    drainAutoInput();
 }
 
 void endWaitForInput() {
@@ -113,13 +156,17 @@ try
         if (isAutoMode && hasAutoInput()) {
             key = getAutoInput();
             keyPressed = true;
-        } else if (kbhit()) {
+        } else if (!isAutoMode && kbhit()) {
             key = getch();
             keyPressed = true;
         }
 
-        if (keyPressed) 
+        if (keyPressed)
         {
+            if (upgradeInProgress) {
+                // Ignore all input while an upgrade is running
+                continue;
+            }
             // Press the esc key to exit
             if (key == ESC || key == 'q' || key == 'Q')
             {
@@ -136,6 +183,7 @@ try
         }
     }
 
+    waitForUpgradesToComplete();
     endWaitForInput();
 
     return 0;
@@ -144,8 +192,9 @@ catch (ob::Error &e)
 {
     std::cerr << "function:" << e.getName() << "\nargs:" << e.getArgs() << "\nmessage:" << e.getMessage() << "\ntype:" << e.getExceptionType() << std::endl;
 
+    waitForUpgradesToComplete();
     endWaitForInput();
-    
+
     exit(EXIT_FAILURE);
 }
 
@@ -236,6 +285,12 @@ void handleDeviceDisconnected(std::shared_ptr<ob::DeviceList> disconnectList)
  */
 void upgradeDevices(std::string filePath)
 {
+    if (upgradeInProgress.exchange(true)) {
+        std::cout << "Upgrade already in progress, ignoring request." << std::endl;
+        return;
+    }
+    std::cout << "Starting firmware upgrade..." << std::endl;
+
     // Ensure filePath ends with '/'
     if (filePath.back() != '/') {
         filePath += '/';
@@ -287,41 +342,39 @@ void upgradeDevices(std::string filePath)
 
             // Construct the command line for firmware upgrade
             //USBDownloadTool.exe "<firmware_path>" <disk_number>
-            std::string cmd = "USBDownloadTool.exe \"" + filePath + "\"" + " " + std::to_string(diskNumber);
-            
-            // Create a future object for an asynchronous task
-            std::future<void> cmdFuture;
-            if (!cmdFuture.valid())
-            {
-                // If the future object is invalid, create a new asynchronous task
-                cmdFuture = std::async(std::launch::async, [cmd, diskNumber]()
-                                       {
-                    uint64_t startTimestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-                    
-                     // Execute an external command and read its output
-                    FILE *pipe               = NULL;
-                    pipe = _popen(cmd.c_str(), "r");
-                    if(NULL == pipe) {
-                        std::cout << "popen failed!" << std::endl;
-                        return;
-                    }
-                    while(!feof(pipe)) {
-                        char buf[1024];
-                        fgets(buf, 1024, pipe);
-                        std::string msg = std::string(buf);
-                        if(msg != "\r\n") {
-                            std::cout << "Firmware Upgrade Msg:" << msg << std::endl;
-                        }
-                    }
+            std::string cmd = "USBDownloadTool.exe \"" + filePath + "\"" + " " + std::to_string(diskNumber) + " <NUL";
 
-                    // Close the pipe and calculate the end time
-                    _pclose(pipe);
-                    
-                    uint64_t endTimestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-                    float    costTime       = (endTimestamp - startTimestamp) / 1000.0;
-                    std::cout << "Firmware Upgrade cost time(s):" << costTime << std::endl;
-                    
-                    upgradedDeviceSet.erase(diskNumber); });
+            auto cmdFuture = std::async(std::launch::async, [cmd, diskNumber]()
+                                   {
+                uint64_t startTimestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+
+                 // Execute an external command and read its output
+                FILE *pipe               = NULL;
+                pipe = _popen(cmd.c_str(), "r");
+                if(NULL == pipe) {
+                    std::cout << "popen failed!" << std::endl;
+                    return;
+                }
+                while(!feof(pipe)) {
+                    char buf[1024];
+                    fgets(buf, 1024, pipe);
+                    std::string msg = std::string(buf);
+                    if(msg != "\r\n") {
+                        std::cout << "Firmware Upgrade Msg:" << msg << std::endl;
+                    }
+                }
+
+                // Close the pipe and calculate the end time
+                _pclose(pipe);
+
+                uint64_t endTimestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                float    costTime       = (endTimestamp - startTimestamp) / 1000.0;
+                std::cout << "Firmware Upgrade cost time(s):" << costTime << std::endl;
+
+                upgradedDeviceSet.erase(diskNumber); });
+            {
+                std::lock_guard<std::mutex> lock(upgradeFuturesMutex);
+                upgradeFutures.push_back(std::move(cmdFuture));
             }
         }
 
@@ -377,40 +430,44 @@ void upgradeDevices(std::string filePath)
         // upgrade devices
         // Construct the command line for the firmware upgrade tool.
         //usbdownloade  <scsi_device>   <firmware_path>
-        std::string cmd = "./usbdownload \"" + path + "\"" + " " + filePath;
-        std::future<void> cmdFuture;
-        if (!cmdFuture.valid())
-        {
-            cmdFuture = std::async(std::launch::async, [cmd]()
-                                   {
-                uint64_t startTimestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-                // Execute the command and open a pipe to read its output.
-                FILE *pipe               = NULL;
-                pipe = popen(cmd.c_str(), "r");
-                if(NULL == pipe) {
-                    std::cout << "popen failed!" << std::endl;
-                    return;
+        std::string cmd = "./usbdownload \"" + path + "\"" + " " + filePath + " </dev/null";
+        auto cmdFuture = std::async(std::launch::async, [cmd]()
+                               {
+            uint64_t startTimestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+            // Execute the command and open a pipe to read its output.
+            FILE *pipe               = NULL;
+            pipe = popen(cmd.c_str(), "r");
+            if(NULL == pipe) {
+                std::cout << "popen failed!" << std::endl;
+                return;
+            }
+            while(!feof(pipe)) {
+                // Read lines from the pipe and print any non-empty output.
+                char buf[1024];
+                fgets(buf, 1024, pipe);
+                std::string msg = std::string(buf);
+                if(msg != "\r\n") {
+                    std::cout << "Firmware Upgrade Msg:" << msg << std::endl;
                 }
-                while(!feof(pipe)) {
-                    // Read lines from the pipe and print any non-empty output.
-                    char buf[1024];
-                    fgets(buf, 1024, pipe);
-                    std::string msg = std::string(buf);
-                    if(msg != "\r\n") {
-                        std::cout << "Firmware Upgrade Msg:" << msg << std::endl;
-                    }
-                }
+            }
 
-                // Close the pipe and calculate the end time.
-                pclose(pipe);
-                uint64_t endTimestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-                float    costTime       = (endTimestamp - startTimestamp) / 1000.0;
-                std::cout << "Firmware Upgrade cost time(s):" << costTime << std::endl; 
-            });
+            // Close the pipe and calculate the end time.
+            pclose(pipe);
+            uint64_t endTimestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+            float    costTime       = (endTimestamp - startTimestamp) / 1000.0;
+            std::cout << "Firmware Upgrade cost time(s):" << costTime << std::endl;
+        });
+        {
+            std::lock_guard<std::mutex> lock(upgradeFuturesMutex);
+            upgradeFutures.push_back(std::move(cmdFuture));
         }
     }
 
 #endif
+
+    // Wait for all flash tasks to finish before returning
+    waitForUpgradesToComplete();
+    std::cout << "Firmware upgrade finished." << std::endl;
 }
 
 void printDevicesInfo()
