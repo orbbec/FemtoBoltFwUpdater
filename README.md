@@ -1,6 +1,6 @@
 # FemtoBoltUpgrade
 
-This repository contains a sample project for upgrading the firmware of Femto Bolt devices.The sample project supports both Windows and Linux platforms, offering a foundational framework for integrating firmware upgrades into developer applications.
+This repository contains a sample project for upgrading the firmware of Femto Bolt devices.The sample project supports Windows, Linux (x64), and Linux (ARM64) platforms, offering a foundational framework for integrating firmware upgrades into developer applications.
 
 ## build
 
@@ -12,10 +12,16 @@ For windows, you need:
 - Visual Studio 2017 or later with MSVC v141 toolset
 - CMake (v3.5 or later)
 
-For Linux,  you need:
+For Linux (x64), you need:
 
 - Ubuntu 18.04 is recommended
-- GCC 7.4
+- GCC 7.5
+- CMake (v3.5 or later)
+
+For Linux (ARM64), you need:
+
+- Ubuntu 18.04 or later for ARM64 is recommended
+- GCC 7.5 or later (aarch64 toolchain)
 - CMake (v3.5 or later)
 
 Firmware download link for femto bolt：[Femto Bolt Firmware](https://github.com/orbbec/OrbbecFirmware)
@@ -29,7 +35,13 @@ windows
  mkdir build && cd build && cmake .. && cmake --build . --config Release
 ```
 
-Linux
+Linux (x64)
+
+```bash
+ mkdir build && cd build && cmake .. && cmake --build . --config Release
+```
+
+Linux (ARM64)
 
 ```bash
  mkdir build && cd build && cmake .. && cmake --build . --config Release
@@ -51,21 +63,37 @@ windows
 
 - 4.Wait a moment, then type U or u to start the upgrade, or Esc to exit the upgrade
 
-Linux
+Linux (x64)
 
-- 1.Copy FemtoBoltUpgrader.exe to the Release/linux directory
+- 1.Copy FemtoBoltUpgrader to the Release/linux directory
 - 2.Open the terminal in the linux directory
-- 3.in Release/linux directory ,Enter
+- 3.in Release/linux directory, Enter
  ```bash
      chmod +x usbdownload
 ```
 - 4.Enter the following command:
 
 ```bash
- .\FemtoBoltUpgrader  path(Directory to upgrade firmware)
+ sudo ./FemtoBoltUpgrader  path(Directory to upgrade firmware)
 ```
 
-- 4.Wait a moment, then type U or u to start the upgrade, or Esc to exit the upgrade
+- 5.Wait a moment, then type U or u to start the upgrade, or Esc to exit the upgrade
+
+Linux (ARM64)
+
+- 1.Copy FemtoBoltUpgrader to the Release/arm64 directory
+- 2.Open the terminal in the arm64 directory
+- 3.in Release/arm64 directory, Enter
+ ```bash
+     chmod +x usbdownload
+```
+- 4.Enter the following command:
+
+```bash
+ sudo ./FemtoBoltUpgrader  path(Directory to upgrade firmware)
+```
+
+- 5.Wait a moment, then type U or u to start the upgrade, or Esc to exit the upgrade
 
 ## Code Description
 

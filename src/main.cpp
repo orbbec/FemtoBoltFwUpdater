@@ -284,7 +284,7 @@ void upgradeDevices(std::string filePath)
 
     // Define the system device directory and the prefix for SCSI generic devices.
     const std::string devDir = "/dev/";
-    const std::string sgPrefix = "sg";
+    const std::vector<std::string> devPrefixes = {"sg", "sd"};
 
     DIR *dir = opendir(devDir.c_str());
     if (dir == nullptr)
@@ -301,11 +301,15 @@ void upgradeDevices(std::string filePath)
     while ((entry = readdir(dir)) != nullptr)
     {
         std::string filename(entry->d_name);
-        if (filename.compare(0, sgPrefix.size(), sgPrefix) == 0)
+        for (const auto &prefix : devPrefixes)
         {
-            // Construct the full path to the device.
-            std::string devicePath = devDir + filename;
-            devicePaths.push_back(devicePath);
+            if (filename.compare(0, prefix.size(), prefix) == 0)
+            {
+                // Construct the full path to the device.
+                std::string devicePath = devDir + filename;
+                devicePaths.push_back(devicePath);
+                break;
+            }
         }
     }
 
