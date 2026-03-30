@@ -12,6 +12,7 @@
 #include <vector>
 #include <atomic>
 #include <queue>
+#include <fstream>
 
 #ifdef WIN32
 #include <conio.h>
@@ -410,13 +411,32 @@ void upgradeDevices(std::string filePath)
     struct dirent *entry;
     std::vector<std::string> devicePaths;
 
-    // Collect paths of devices starting with the specified prefix.
+    // Collect paths of SCSI generic devices that are Orbbec cameras in DFU mode.
+    // The camera identifies as "GCREADER" vendor in DFU/upgrade mode.
+    // We filter by vendor to avoid sending firmware commands to unrelated SCSI
+    // devices (e.g. VTAP NFC readers) that also appear as /dev/sg*.
     while ((entry = readdir(dir)) != nullptr)
     {
         std::string filename(entry->d_name);
         if (filename.compare(0, sgPrefix.size(), sgPrefix) == 0)
         {
-            // Construct the full path to the device.
+            // Check if this sg device is an Orbbec camera in DFU mode
+            std::string vendorPath = "/sys/class/scsi_generic/" + filename + "/device/vendor";
+            std::ifstream vendorFile(vendorPath);
+            if (vendorFile.is_open())
+            {
+                std::string vendor;
+                std::getline(vendorFile, vendor);
+                vendorFile.close();
+                // Trim trailing whitespace
+                vendor.erase(vendor.find_last_not_of(" \t\n\r") + 1);
+                if (vendor != "GCREADER")
+                {
+                    std::cout << "Skipping " << filename << " (vendor: " << vendor << ", not an Orbbec camera)" << std::endl;
+                    continue;
+                }
+            }
+
             std::string devicePath = devDir + filename;
             devicePaths.push_back(devicePath);
         }
