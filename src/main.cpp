@@ -11,6 +11,7 @@
 #include <vector>
 #include <chrono>
 #include <cstring>
+#include <fstream>
 
 #ifdef WIN32
 #include <conio.h>
@@ -52,12 +53,12 @@ void printDevicesInfo();
 void printSummary(std::vector<DeviceUpgradeContext> &totalDevices);
 
 #ifdef WIN32
-bool upgradeSingleDeviceWindows(const std::string &filePath, DeviceUpgradeContext &ctx, std::set<int> &upgradedDeviceSet);
-void upgradeRecoveryDevicesWindows(const std::string &filePath, std::vector<DeviceUpgradeContext> &totalDevices, std::set<int> &upgradedDeviceSet);
+bool upgradeSingleDeviceWindows(const std::string &filePath, DeviceUpgradeContext &ctx, std::set<int> &usedDiskSet);
+void upgradeRecoveryDevicesWindows(const std::string &filePath, std::vector<DeviceUpgradeContext> &totalDevices, std::set<int> &usedDiskSet);
 int runCommandWithTimeout(const std::string &cmd, std::string &output, DWORD timeoutMs);
 #else
-bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext &ctx, std::set<std::string> &upgradedDevicePaths);
-void upgradeRecoveryDevicesLinux(const std::string &filePath, std::vector<DeviceUpgradeContext> &totalDevices, std::set<std::string> &upgradedDevicePaths);
+bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext &ctx, std::set<std::string> &usedDevicePaths);
+void upgradeRecoveryDevicesLinux(const std::string &filePath, std::vector<DeviceUpgradeContext> &totalDevices, std::set<std::string> &usedDevicePaths);
 #endif
 
 int main(int argc, char **argv)
@@ -168,44 +169,33 @@ try
     std::cout << "\nStarting firmware upgrade..." << std::endl;
 
 #ifdef WIN32
-    std::set<int> upgradedDeviceSet;
-    if (!totalDevices.empty())
+    std::set<int> usedDiskSet;
+    for (size_t i = 0; i < totalDevices.size(); ++i)
     {
-        for (size_t i = 0; i < totalDevices.size(); ++i)
+        std::cout << "\nUpgrading device: " << (i + 1) << "/" << totalDevices.size()
+                  << " - " << totalDevices[i].name << " | SN: " << totalDevices[i].serialNumber << std::endl;
+        if (!upgradeSingleDeviceWindows(filePath, totalDevices[i], usedDiskSet))
         {
-            std::cout << "\nUpgrading device: " << (i + 1) << "/" << totalDevices.size()
-                      << " - " << totalDevices[i].name << " | SN: " << totalDevices[i].serialNumber << std::endl;
-            if (!upgradeSingleDeviceWindows(filePath, totalDevices[i], upgradedDeviceSet))
-            {
-                std::cerr << "Failed to upgrade device: " << totalDevices[i].serialNumber
-                          << " - " << totalDevices[i].errorMsg << std::endl;
-            }
+            std::cerr << "Failed to upgrade device: " << totalDevices[i].serialNumber
+                      << " - " << totalDevices[i].errorMsg << std::endl;
         }
     }
-    else
-    {
-        // Recovery mode: no normal devices detected, scan SCSI directly
-        upgradeRecoveryDevicesWindows(filePath, totalDevices, upgradedDeviceSet);
-    }
+    // After normal devices, scan for any remaining recovery mode devices
+    upgradeRecoveryDevicesWindows(filePath, totalDevices, usedDiskSet);
 #else
-    std::set<std::string> upgradedDevicePaths;
-    if (!totalDevices.empty())
+    std::set<std::string> usedDevicePaths;
+    for (size_t i = 0; i < totalDevices.size(); ++i)
     {
-        for (size_t i = 0; i < totalDevices.size(); ++i)
+        std::cout << "\nUpgrading device: " << (i + 1) << "/" << totalDevices.size()
+                  << " - " << totalDevices[i].name << " | SN: " << totalDevices[i].serialNumber << std::endl;
+        if (!upgradeSingleDeviceLinux(filePath, totalDevices[i], usedDevicePaths))
         {
-            std::cout << "\nUpgrading device: " << (i + 1) << "/" << totalDevices.size()
-                      << " - " << totalDevices[i].name << " | SN: " << totalDevices[i].serialNumber << std::endl;
-            if (!upgradeSingleDeviceLinux(filePath, totalDevices[i], upgradedDevicePaths))
-            {
-                std::cerr << "Failed to upgrade device: " << totalDevices[i].serialNumber
-                          << " - " << totalDevices[i].errorMsg << std::endl;
-            }
+            std::cerr << "Failed to upgrade device: " << totalDevices[i].serialNumber
+                      << " - " << totalDevices[i].errorMsg << std::endl;
         }
     }
-    else
-    {
-        upgradeRecoveryDevicesLinux(filePath, totalDevices, upgradedDevicePaths);
-    }
+    // After normal devices, scan for any remaining recovery mode devices
+    upgradeRecoveryDevicesLinux(filePath, totalDevices, usedDevicePaths);
 #endif
 
     printSummary(totalDevices);
@@ -478,7 +468,7 @@ void printSummary(std::vector<DeviceUpgradeContext> &totalDevices)
 }
 
 #ifdef WIN32
-bool upgradeSingleDeviceWindows(const std::string &filePath, DeviceUpgradeContext &ctx, std::set<int> &upgradedDeviceSet)
+bool upgradeSingleDeviceWindows(const std::string &filePath, DeviceUpgradeContext &ctx, std::set<int> &usedDiskSet)
 {
     // 1. Find the device in pipelineHolderMap and set it to recovery mode
     std::shared_ptr<ob::Pipeline> pipeline;
@@ -528,7 +518,23 @@ bool upgradeSingleDeviceWindows(const std::string &filePath, DeviceUpgradeContex
         std::cout << "Warning: Device may have rebooted into recovery mode, continuing..." << std::endl;
     }
 
-    // 2. Wait for the device to appear as a SCSI recovery device
+    // 2. Wait for the device to appear as a SCSI recovery device.
+    // Before scanning, find all OTHER recovery devices currently online
+    // so we don't accidentally pick them up instead of the device we just rebooted.
+    std::set<int> otherRecoveryDisks;
+    {
+        std::set<int> tempExclude = usedDiskSet;
+        while (true) {
+            int ds = DEV_STATE_UNKNOWN, dn = 0;
+            HANDLE h = USB_ScsiFindDevice(&ds, &dn, tempExclude);
+            if (!h || ds == DEV_STATE_UNKNOWN) break;
+            tempExclude.insert(dn);
+            otherRecoveryDisks.insert(dn);
+        }
+    }
+    std::set<int> scanExclude = usedDiskSet;
+    scanExclude.insert(otherRecoveryDisks.begin(), otherRecoveryDisks.end());
+
     HANDLE handle = NULL;
     int devState = DEV_STATE_UNKNOWN;
     int diskNumber = 0;
@@ -537,11 +543,11 @@ bool upgradeSingleDeviceWindows(const std::string &filePath, DeviceUpgradeContex
     // Wait up to 30 seconds (60 * 500ms)
     for (int retry = 0; retry < 60; ++retry)
     {
-        handle = USB_ScsiFindDevice(&devState, &diskNumber, upgradedDeviceSet);
+        handle = USB_ScsiFindDevice(&devState, &diskNumber, scanExclude);
         if (handle && devState != DEV_STATE_UNKNOWN)
         {
             found = true;
-            upgradedDeviceSet.insert(diskNumber);
+            usedDiskSet.insert(diskNumber);
             std::cout << "Recovery device found at disk " << (char)diskNumber << std::endl;
             break;
         }
@@ -554,14 +560,6 @@ bool upgradeSingleDeviceWindows(const std::string &filePath, DeviceUpgradeContex
         ctx.finalFailure = true;
         return false;
     }
-
-    // Ensure diskNumber is removed from set after upgrade (RAII-like cleanup)
-    struct DiskNumberGuard {
-        std::set<int> *set;
-        int disk;
-        DiskNumberGuard(std::set<int> *s, int d) : set(s), disk(d) {}
-        ~DiskNumberGuard() { if (set) set->erase(disk); }
-    } guard(&upgradedDeviceSet, diskNumber);
 
     // 3. Execute the firmware upgrade tool synchronously with timeout (5 minutes)
     std::string cmd = "USBDownloadTool.exe \"" + filePath + "\" " + std::to_string(diskNumber);
@@ -602,7 +600,7 @@ bool upgradeSingleDeviceWindows(const std::string &filePath, DeviceUpgradeContex
     return true;
 }
 
-void upgradeRecoveryDevicesWindows(const std::string &filePath, std::vector<DeviceUpgradeContext> &totalDevices, std::set<int> &upgradedDeviceSet)
+void upgradeRecoveryDevicesWindows(const std::string &filePath, std::vector<DeviceUpgradeContext> &totalDevices, std::set<int> &usedDiskSet)
 {
     std::cout << "Scanning for recovery mode devices..." << std::endl;
 
@@ -614,12 +612,12 @@ void upgradeRecoveryDevicesWindows(const std::string &filePath, std::vector<Devi
         int devState = DEV_STATE_UNKNOWN;
         int diskNumber = 0;
 
-        handle = USB_ScsiFindDevice(&devState, &diskNumber, upgradedDeviceSet);
+        handle = USB_ScsiFindDevice(&devState, &diskNumber, usedDiskSet);
 
         if (handle)
         {
             retryTimes = 10;
-            upgradedDeviceSet.insert(diskNumber);
+            usedDiskSet.insert(diskNumber);
             deviceIndex++;
 
             DeviceUpgradeContext ctx;
@@ -664,7 +662,7 @@ void upgradeRecoveryDevicesWindows(const std::string &filePath, std::vector<Devi
             totalDevices.push_back(ctx);
         }
 
-        if (!handle && retryTimes-- == 0)
+        if (!handle && --retryTimes == 0)
         {
             break;
         }
@@ -839,8 +837,31 @@ int runCommandWithTimeoutLinux(const std::string &cmd, std::string &output, int 
     return -1;
 }
 
-bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext &ctx, std::set<std::string> &upgradedDevicePaths)
+static bool isFemtoBoltRecoveryDevice(const std::string &devicePath)
 {
+    // devicePath is like "/dev/sg1" or "/dev/sdb"
+    size_t pos = devicePath.rfind('/');
+    if (pos == std::string::npos) return false;
+    std::string devName = devicePath.substr(pos + 1);
+
+    // Try scsi_generic sysfs first (for /dev/sg*)
+    std::string vendorPath = "/sys/class/scsi_generic/" + devName + "/device/vendor";
+    std::ifstream fs(vendorPath);
+    if (!fs) {
+        // Fallback: try scsi_disk sysfs (for /dev/sd*)
+        vendorPath = "/sys/class/scsi_disk/" + devName + "/device/vendor";
+        fs.open(vendorPath);
+        if (!fs) return false;
+    }
+
+    std::string vendor;
+    fs >> vendor;
+    return (vendor.size() >= 2 && vendor[0] == 'G' && vendor[1] == 'C');
+}
+
+bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext &ctx, std::set<std::string> &usedDevicePaths)
+{
+
     // 1. Find the device in pipelineHolderMap and set it to recovery mode
     std::shared_ptr<ob::Pipeline> pipeline;
     {
@@ -889,11 +910,37 @@ bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext 
         std::cout << "Warning: Device may have rebooted into recovery mode, continuing..." << std::endl;
     }
 
+    // Before waiting, find all OTHER recovery devices currently online
+    // so we don't accidentally pick them up instead of the device we just rebooted.
+    std::set<std::string> otherRecoveryDevices;
+    {
+        const std::string devDir = "/dev/";
+        const std::vector<std::string> devPrefixes = {"sg", "sd"};
+        DIR *dir = opendir(devDir.c_str());
+        if (dir) {
+            struct dirent *entry;
+            while ((entry = readdir(dir)) != nullptr) {
+                std::string filename(entry->d_name);
+                for (const auto &prefix : devPrefixes) {
+                    if (filename.compare(0, prefix.size(), prefix) == 0) {
+                        std::string devicePath = devDir + filename;
+                        if (usedDevicePaths.find(devicePath) == usedDevicePaths.end() &&
+                            isFemtoBoltRecoveryDevice(devicePath)) {
+                            otherRecoveryDevices.insert(devicePath);
+                        }
+                        break;
+                    }
+                }
+            }
+            closedir(dir);
+        }
+    }
+
     // 2. Wait for the device to enter recovery mode
     // Wait 10 seconds for the device to reboot
     std::this_thread::sleep_for(std::chrono::seconds(10));
 
-    // 3. Scan for SCSI generic devices, skipping already upgraded ones
+    // 3. Scan for SCSI generic devices, skipping already upgraded ones and other pre-existing recovery devices
     const std::string devDir = "/dev/";
     const std::vector<std::string> devPrefixes = {"sg", "sd"};
 
@@ -915,7 +962,9 @@ bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext 
             if (filename.compare(0, prefix.size(), prefix) == 0)
             {
                 std::string devicePath = devDir + filename;
-                if (upgradedDevicePaths.find(devicePath) == upgradedDevicePaths.end())
+                if (usedDevicePaths.find(devicePath) == usedDevicePaths.end() &&
+                    otherRecoveryDevices.find(devicePath) == otherRecoveryDevices.end() &&
+                    isFemtoBoltRecoveryDevice(devicePath))
                 {
                     targetPath = devicePath;
                     break;
@@ -934,7 +983,7 @@ bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext 
         return false;
     }
 
-    upgradedDevicePaths.insert(targetPath);
+    usedDevicePaths.insert(targetPath);
     std::cout << "Recovery device found at: " << targetPath << std::endl;
 
     // 4. Execute the firmware upgrade tool synchronously with timeout (5 minutes)
@@ -973,7 +1022,7 @@ bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext 
     return true;
 }
 
-void upgradeRecoveryDevicesLinux(const std::string &filePath, std::vector<DeviceUpgradeContext> &totalDevices, std::set<std::string> &upgradedDevicePaths)
+void upgradeRecoveryDevicesLinux(const std::string &filePath, std::vector<DeviceUpgradeContext> &totalDevices, std::set<std::string> &usedDevicePaths)
 {
     std::cout << "Scanning for recovery mode devices..." << std::endl;
 
@@ -1000,7 +1049,8 @@ void upgradeRecoveryDevicesLinux(const std::string &filePath, std::vector<Device
             if (filename.compare(0, prefix.size(), prefix) == 0)
             {
                 std::string devicePath = devDir + filename;
-                if (upgradedDevicePaths.find(devicePath) == upgradedDevicePaths.end())
+                if (usedDevicePaths.find(devicePath) == usedDevicePaths.end() &&
+                    isFemtoBoltRecoveryDevice(devicePath))
                 {
                     devicePaths.push_back(devicePath);
                 }
@@ -1019,7 +1069,7 @@ void upgradeRecoveryDevicesLinux(const std::string &filePath, std::vector<Device
     int deviceIndex = 0;
     for (const auto &path : devicePaths)
     {
-        upgradedDevicePaths.insert(path);
+        usedDevicePaths.insert(path);
         deviceIndex++;
 
         DeviceUpgradeContext ctx;
