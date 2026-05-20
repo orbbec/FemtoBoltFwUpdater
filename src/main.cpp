@@ -841,12 +841,14 @@ bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext 
         return false;
     }
 
+    std::string cmdOutput;
     while (!feof(pipe))
     {
         char buf[1024];
         if (fgets(buf, 1024, pipe) != NULL)
         {
             std::string msg = std::string(buf);
+            cmdOutput += msg;
             if (msg != "\r\n" && msg != "\n")
             {
                 std::cout << "Firmware Upgrade Msg: " << msg;
@@ -868,6 +870,18 @@ bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext 
     if (exitCode != 0)
     {
         ctx.errorMsg = "Firmware upgrade tool returned error code: " + std::to_string(exitCode);
+        ctx.finalFailure = true;
+        return false;
+    }
+
+    // usbdownload may return 0 even when errors occurred (e.g. permission denied, RDONLY).
+    // Check output for known failure keywords.
+    if (cmdOutput.find("RDONLY") != std::string::npos ||
+        cmdOutput.find("error") != std::string::npos ||
+        cmdOutput.find("load fail") != std::string::npos ||
+        cmdOutput.find("open script fail") != std::string::npos)
+    {
+        ctx.errorMsg = "Firmware upgrade failed: device I/O error or permission denied (try sudo)";
         ctx.finalFailure = true;
         return false;
     }
@@ -944,12 +958,14 @@ void upgradeRecoveryDevicesLinux(const std::string &filePath, std::vector<Device
             continue;
         }
 
+        std::string cmdOutput;
         while (!feof(pipe))
         {
             char buf[1024];
             if (fgets(buf, 1024, pipe) != NULL)
             {
                 std::string msg = std::string(buf);
+                cmdOutput += msg;
                 if (msg != "\r\n" && msg != "\n")
                 {
                     std::cout << "Firmware Upgrade Msg: " << msg;
@@ -971,6 +987,14 @@ void upgradeRecoveryDevicesLinux(const std::string &filePath, std::vector<Device
         if (exitCode != 0)
         {
             ctx.errorMsg = "Firmware upgrade tool returned error code: " + std::to_string(exitCode);
+            ctx.finalFailure = true;
+        }
+        else if (cmdOutput.find("RDONLY") != std::string::npos ||
+                 cmdOutput.find("error") != std::string::npos ||
+                 cmdOutput.find("load fail") != std::string::npos ||
+                 cmdOutput.find("open script fail") != std::string::npos)
+        {
+            ctx.errorMsg = "Firmware upgrade failed: device I/O error or permission denied (try sudo)";
             ctx.finalFailure = true;
         }
         else
