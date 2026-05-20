@@ -1,6 +1,7 @@
 #include "libobsensor/ObSensor.hpp"
 #include "usbscsicmd.h"
 #include "utils.hpp"
+#include <algorithm>
 #include <iostream>
 #include <thread>
 #include <map>
@@ -16,7 +17,11 @@
 #include <windows.h>
 #else
 #include <dirent.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/types.h>
 #include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 #define ESC 27
@@ -25,7 +30,6 @@ typedef struct PipelineHolder_t
 {
     std::shared_ptr<ob::Pipeline> pipeline;
     std::shared_ptr<ob::DeviceInfo> deviceInfo;
-    bool isUpgraded;
 } PipelineHolder;
 
 struct DeviceUpgradeContext
@@ -78,8 +82,14 @@ try
     // Ensure filePath ends with '/' for directory-based firmware path (original behavior).
     // Do not append '/' if the path points to a .zip file, since USBDownloadTool also accepts zip directly.
     if (!filePath.empty() && filePath.back() != '/') {
-        if (filePath.size() < 4 || filePath.substr(filePath.size() - 4) != ".zip") {
+        if (filePath.size() < 4) {
             filePath += '/';
+        } else {
+            std::string ext = filePath.substr(filePath.size() - 4);
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            if (ext != ".zip") {
+                filePath += '/';
+            }
         }
     }
     // create context
@@ -258,8 +268,10 @@ void handleDeviceConnected(std::shared_ptr<ob::DeviceList> connectList)
         {
             auto device = connectList->getDevice(i);
             auto deviceInfo = device->getDeviceInfo();
-            std::shared_ptr<ob::Pipeline> pipeline(new ob::Pipeline(device));
-            std::shared_ptr<PipelineHolder> holder(new PipelineHolder{pipeline, deviceInfo, false});
+            auto pipeline = std::make_shared<ob::Pipeline>(device);
+            auto holder = std::make_shared<PipelineHolder>();
+            holder->pipeline = pipeline;
+            holder->deviceInfo = deviceInfo;
             // Adds the new PipelineHolder to the pipelineHolderMap.
             pipelineHolderMap.insert({uid, holder});
             std::cout << "Device connected. " << deviceInfo << std::endl;
@@ -339,33 +351,27 @@ static void waitForDevicesReconnection(const std::vector<DeviceUpgradeContext*> 
     for (int retry = 0; retry < 60; ++retry)
     {
         bool allOnline = true;
+        int unknownCount = 0;
+        int onlineCount = 0;
         for (const auto *ctx : successDevices)
         {
             if (ctx->serialNumber == "Unknown")
             {
-                // Recovery mode device: check if any new Femto Bolt is online
-                bool anyOnline = false;
-                {
-                    std::lock_guard<std::recursive_mutex> lk(pipelineHolderMutex);
-                    for (const auto &iter : pipelineHolderMap)
-                    {
-                        if (iter.second->deviceInfo)
-                        {
-                            anyOnline = true;
-                            break;
-                        }
-                    }
-                }
-                if (!anyOnline)
-                {
-                    allOnline = false;
-                    break;
-                }
+                unknownCount++;
             }
             else if (getLatestFirmwareVersionBySN(ctx->serialNumber).empty())
             {
                 allOnline = false;
                 break;
+            }
+        }
+        if (unknownCount > 0)
+        {
+            std::lock_guard<std::recursive_mutex> lk(pipelineHolderMutex);
+            onlineCount = static_cast<int>(pipelineHolderMap.size());
+            if (onlineCount < unknownCount)
+            {
+                allOnline = false;
             }
         }
         if (allOnline)
@@ -381,6 +387,7 @@ static void waitForDevicesReconnection(const std::vector<DeviceUpgradeContext*> 
 static void updateDeviceInfoFromOnlineMap(std::vector<DeviceUpgradeContext> &totalDevices)
 {
     std::lock_guard<std::recursive_mutex> lk(pipelineHolderMutex);
+    std::set<std::string> assignedUIDs;
     for (auto &ctx : totalDevices)
     {
         if (!ctx.finalSuccess) continue;
@@ -394,6 +401,7 @@ static void updateDeviceInfoFromOnlineMap(std::vector<DeviceUpgradeContext> &tot
                     iter.second->deviceInfo->serialNumber() == ctx.serialNumber)
                 {
                     ctx.firmwareVersion = iter.second->deviceInfo->firmwareVersion();
+                    assignedUIDs.insert(iter.first);
                     break;
                 }
             }
@@ -403,10 +411,13 @@ static void updateDeviceInfoFromOnlineMap(std::vector<DeviceUpgradeContext> &tot
             // Recovery mode device: match any unassigned online device
             for (const auto &iter : pipelineHolderMap)
             {
+                if (assignedUIDs.find(iter.first) != assignedUIDs.end())
+                    continue;
                 if (iter.second->deviceInfo)
                 {
                     ctx.serialNumber = iter.second->deviceInfo->serialNumber();
                     ctx.firmwareVersion = iter.second->deviceInfo->firmwareVersion();
+                    assignedUIDs.insert(iter.first);
                     break;
                 }
             }
@@ -440,14 +451,14 @@ void printSummary(std::vector<DeviceUpgradeContext> &totalDevices)
     std::cout << "Success (" << successDevices.size() << "):" << std::endl;
     for (const auto *ctx : successDevices)
     {
-        std::string latestFirmwareVersion = getLatestFirmwareVersionBySN(ctx->serialNumber);
-        if (latestFirmwareVersion.empty())
+        std::string versionStr = ctx->firmwareVersion;
+        if (versionStr.empty())
         {
-            latestFirmwareVersion = ctx->firmwareVersion + " (device offline, pre-upgrade version)";
+            versionStr = "Unknown (device offline, pre-upgrade version)";
         }
         std::cout << "  - Name: " << ctx->name
                   << " | SN: " << ctx->serialNumber
-                  << " | Firmware version: " << latestFirmwareVersion << std::endl;
+                  << " | Firmware version: " << versionStr << std::endl;
     }
 
     std::cout << "\nFailure (" << failedDevices.size() << "):" << std::endl;
@@ -565,6 +576,13 @@ bool upgradeSingleDeviceWindows(const std::string &filePath, DeviceUpgradeContex
         return false;
     }
 
+    if (status != 0)
+    {
+        ctx.errorMsg = "Firmware upgrade tool returned error code: " + std::to_string(status);
+        ctx.finalFailure = true;
+        return false;
+    }
+
     // USBDownloadTool.exe may return 0 even when upgrade actually failed (e.g. open script fail).
     // Check output for known failure keywords.
     if (cmdOutput.find("open script fail") != std::string::npos)
@@ -588,7 +606,7 @@ void upgradeRecoveryDevicesWindows(const std::string &filePath, std::vector<Devi
 {
     std::cout << "Scanning for recovery mode devices..." << std::endl;
 
-    uint8_t retryTimes = 10;
+    int retryTimes = 10;
     int deviceIndex = 0;
     while (true)
     {
@@ -598,7 +616,7 @@ void upgradeRecoveryDevicesWindows(const std::string &filePath, std::vector<Devi
 
         handle = USB_ScsiFindDevice(&devState, &diskNumber, upgradedDeviceSet);
 
-        if (handle && upgradedDeviceSet.find(diskNumber) == upgradedDeviceSet.end())
+        if (handle)
         {
             retryTimes = 10;
             upgradedDeviceSet.insert(diskNumber);
@@ -739,6 +757,88 @@ int runCommandWithTimeout(const std::string &cmd, std::string &output, DWORD tim
 #endif
 
 #ifndef WIN32
+int runCommandWithTimeoutLinux(const std::string &cmd, std::string &output, int timeoutMs)
+{
+    int stdoutPipe[2];
+    if (pipe(stdoutPipe) == -1) return -1;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(stdoutPipe[0]);
+        close(stdoutPipe[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        close(stdoutPipe[0]);
+        dup2(stdoutPipe[1], STDOUT_FILENO);
+        dup2(stdoutPipe[1], STDERR_FILENO);
+        close(stdoutPipe[1]);
+        execl("/bin/sh", "sh", "-c", cmd.c_str(), (char*)NULL);
+        _exit(127);
+    }
+    close(stdoutPipe[1]);
+
+    int flags = fcntl(stdoutPipe[0], F_GETFL, 0);
+    fcntl(stdoutPipe[0], F_SETFL, flags | O_NONBLOCK);
+
+    auto start = std::chrono::steady_clock::now();
+    char buf[1024];
+    int exitCode = -1;
+    bool processExited = false;
+    int status = 0;
+
+    while (true) {
+        pid_t result = waitpid(pid, &status, WNOHANG);
+        if (result == -1) break;
+
+        if (result == pid) {
+            processExited = true;
+            if (WIFEXITED(status)) {
+                exitCode = WEXITSTATUS(status);
+            } else {
+                exitCode = -1;
+            }
+        }
+
+        ssize_t n = read(stdoutPipe[0], buf, sizeof(buf) - 1);
+        if (n > 0) {
+            buf[n] = '\0';
+            output += buf;
+            std::cout << buf << std::flush;
+        }
+
+        if (processExited) {
+            while (true) {
+                n = read(stdoutPipe[0], buf, sizeof(buf) - 1);
+                if (n > 0) {
+                    buf[n] = '\0';
+                    output += buf;
+                    std::cout << buf << std::flush;
+                } else {
+                    break;
+                }
+            }
+            close(stdoutPipe[0]);
+            return exitCode;
+        }
+
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        if (elapsed >= timeoutMs) {
+            std::cerr << "Command timed out after " << timeoutMs << " ms, terminating process..." << std::endl;
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            close(stdoutPipe[0]);
+            return -1;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    close(stdoutPipe[0]);
+    return -1;
+}
+
 bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext &ctx, std::set<std::string> &upgradedDevicePaths)
 {
     // 1. Find the device in pipelineHolderMap and set it to recovery mode
@@ -837,47 +937,22 @@ bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext 
     upgradedDevicePaths.insert(targetPath);
     std::cout << "Recovery device found at: " << targetPath << std::endl;
 
-    // 4. Execute the firmware upgrade tool synchronously
+    // 4. Execute the firmware upgrade tool synchronously with timeout (5 minutes)
     std::string cmd = "./usbdownload \"" + targetPath + "\" \"" + filePath + "\"";
     std::cout << "Executing: " << cmd << std::endl;
 
-    FILE *pipe = popen(cmd.c_str(), "r");
-    if (pipe == NULL)
+    std::string cmdOutput;
+    int status = runCommandWithTimeoutLinux(cmd, cmdOutput, 300000); // 5 minutes
+    if (status == -1 && cmdOutput.empty())
     {
-        ctx.errorMsg = "Failed to execute usbdownload";
+        ctx.errorMsg = "Failed to execute usbdownload or process creation failed";
         ctx.finalFailure = true;
         return false;
     }
 
-    std::string cmdOutput;
-    while (!feof(pipe))
+    if (status != 0)
     {
-        char buf[1024];
-        if (fgets(buf, 1024, pipe) != NULL)
-        {
-            std::string msg = std::string(buf);
-            cmdOutput += msg;
-            if (msg != "\r\n" && msg != "\n")
-            {
-                std::cout << "Firmware Upgrade Msg: " << msg;
-            }
-        }
-    }
-
-    int status = pclose(pipe);
-    int exitCode = 0;
-    if (WIFEXITED(status))
-    {
-        exitCode = WEXITSTATUS(status);
-    }
-    else
-    {
-        exitCode = -1;
-    }
-
-    if (exitCode != 0)
-    {
-        ctx.errorMsg = "Firmware upgrade tool returned error code: " + std::to_string(exitCode);
+        ctx.errorMsg = "Firmware upgrade tool returned error code: " + std::to_string(status);
         ctx.finalFailure = true;
         return false;
     }
@@ -957,44 +1032,19 @@ void upgradeRecoveryDevicesLinux(const std::string &filePath, std::vector<Device
         std::string cmd = "./usbdownload \"" + path + "\" \"" + filePath + "\"";
         std::cout << "Executing: " << cmd << std::endl;
 
-        FILE *pipe = popen(cmd.c_str(), "r");
-        if (pipe == NULL)
+        std::string cmdOutput;
+        int status = runCommandWithTimeoutLinux(cmd, cmdOutput, 300000); // 5 minutes
+        if (status == -1 && cmdOutput.empty())
         {
-            ctx.errorMsg = "Failed to execute usbdownload";
+            ctx.errorMsg = "Failed to execute usbdownload or process creation failed";
             ctx.finalFailure = true;
             totalDevices.push_back(ctx);
             continue;
         }
 
-        std::string cmdOutput;
-        while (!feof(pipe))
+        if (status != 0)
         {
-            char buf[1024];
-            if (fgets(buf, 1024, pipe) != NULL)
-            {
-                std::string msg = std::string(buf);
-                cmdOutput += msg;
-                if (msg != "\r\n" && msg != "\n")
-                {
-                    std::cout << "Firmware Upgrade Msg: " << msg;
-                }
-            }
-        }
-
-        int status = pclose(pipe);
-        int exitCode = 0;
-        if (WIFEXITED(status))
-        {
-            exitCode = WEXITSTATUS(status);
-        }
-        else
-        {
-            exitCode = -1;
-        }
-
-        if (exitCode != 0)
-        {
-            ctx.errorMsg = "Firmware upgrade tool returned error code: " + std::to_string(exitCode);
+            ctx.errorMsg = "Firmware upgrade tool returned error code: " + std::to_string(status);
             ctx.finalFailure = true;
         }
         else if (cmdOutput.find("RDONLY") != std::string::npos ||

@@ -41,9 +41,6 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${THIRD_PARTY_DIR}/usbscsicmd
 )
 
-# app source files
-target_sources(${PROJECT_NAME} PRIVATE ${SRC_DIR}/main.cpp)
-
 target_link_directories(${PROJECT_NAME} PRIVATE
     ${THIRD_PARTY_DIR}/OrbbecSDK/lib/${CURRENT_BUILD_COMPILER}/
 )
