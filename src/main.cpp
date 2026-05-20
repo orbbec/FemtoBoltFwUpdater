@@ -335,7 +335,8 @@ static void waitForDevicesReconnection(const std::vector<DeviceUpgradeContext*> 
 {
     if (successDevices.empty()) return;
     std::cout << "\nWaiting for upgraded devices to reconnect..." << std::endl;
-    for (int retry = 0; retry < 20; ++retry)
+    // Wait up to 30 seconds (60 * 500ms) for devices to reboot and re-enumerate
+    for (int retry = 0; retry < 60; ++retry)
     {
         bool allOnline = true;
         for (const auto *ctx : successDevices)
@@ -377,31 +378,38 @@ static void waitForDevicesReconnection(const std::vector<DeviceUpgradeContext*> 
     std::cout << "Some devices have not reconnected yet, using pre-upgrade version for those." << std::endl;
 }
 
-static void updateRecoveryDeviceInfo(std::vector<DeviceUpgradeContext> &totalDevices)
+static void updateDeviceInfoFromOnlineMap(std::vector<DeviceUpgradeContext> &totalDevices)
 {
-    std::vector<std::pair<std::string, std::string>> onlineDevices;
-    {
-        std::lock_guard<std::recursive_mutex> lk(pipelineHolderMutex);
-        for (const auto &iter : pipelineHolderMap)
-        {
-            if (iter.second->deviceInfo)
-            {
-                onlineDevices.push_back({
-                    iter.second->deviceInfo->serialNumber(),
-                    iter.second->deviceInfo->firmwareVersion()
-                });
-            }
-        }
-    }
-
-    size_t idx = 0;
+    std::lock_guard<std::recursive_mutex> lk(pipelineHolderMutex);
     for (auto &ctx : totalDevices)
     {
-        if (ctx.finalSuccess && ctx.serialNumber == "Unknown" && idx < onlineDevices.size())
+        if (!ctx.finalSuccess) continue;
+
+        // Try to match by serial number first
+        if (ctx.serialNumber != "Unknown")
         {
-            ctx.serialNumber = onlineDevices[idx].first;
-            ctx.firmwareVersion = onlineDevices[idx].second;
-            idx++;
+            for (const auto &iter : pipelineHolderMap)
+            {
+                if (iter.second->deviceInfo &&
+                    iter.second->deviceInfo->serialNumber() == ctx.serialNumber)
+                {
+                    ctx.firmwareVersion = iter.second->deviceInfo->firmwareVersion();
+                    break;
+                }
+            }
+        }
+        else
+        {
+            // Recovery mode device: match any unassigned online device
+            for (const auto &iter : pipelineHolderMap)
+            {
+                if (iter.second->deviceInfo)
+                {
+                    ctx.serialNumber = iter.second->deviceInfo->serialNumber();
+                    ctx.firmwareVersion = iter.second->deviceInfo->firmwareVersion();
+                    break;
+                }
+            }
         }
     }
 }
@@ -424,7 +432,7 @@ void printSummary(std::vector<DeviceUpgradeContext> &totalDevices)
     }
 
     waitForDevicesReconnection(successDevices);
-    updateRecoveryDeviceInfo(totalDevices);
+    updateDeviceInfoFromOnlineMap(totalDevices);
 
     std::cout << "\nUpgrade Summary:" << std::endl;
     std::cout << "==================================================" << std::endl;
