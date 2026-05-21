@@ -33,6 +33,6 @@ int    USB_ScsiRead(unsigned char *databuf, int len, int retry);
 BOOL   USB_ScsiInquiry(UCHAR *ucDataBuf);
 int    USB_ScsiRunCmd(const char *cmd, int len);
 int    USB_ScsiLoadInfo(void *info, int len);
-HANDLE USB_ScsiFindDevice(int *dev_state,int *disk_number,std::set<int> disk_number_set);
+HANDLE USB_ScsiFindDevice(int *dev_state, int *disk_number, const std::set<int> &disk_number_set);
 HANDLE USB_ScsiRefindDevice(int *dev_state);
 #endif

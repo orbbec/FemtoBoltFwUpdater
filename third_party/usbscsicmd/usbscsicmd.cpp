@@ -268,7 +268,7 @@ HANDLE USB_ScsiRefindDevice(int *dev_state) {
     return m_DeviceHandle;
 }
 
-HANDLE USB_ScsiFindDevice(int *dev_state,int *disk_number,std::set<int> disk_number_set) {
+HANDLE USB_ScsiFindDevice(int *dev_state, int *disk_number, const std::set<int> &disk_number_set) {
     TCHAR diskname[10];
     const TCHAR* src = _T("\\\\.\\F:");
 
