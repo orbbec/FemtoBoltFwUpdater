@@ -57,6 +57,7 @@ void handleDeviceConnected(std::shared_ptr<ob::DeviceList> connectList);
 void handleDeviceDisconnected(std::shared_ptr<ob::DeviceList> disconnectList);
 void printDevicesInfo();
 void printSummary(std::vector<DeviceUpgradeContext> &totalDevices);
+static void rebootAllSuccessDevices(const std::vector<DeviceUpgradeContext> &totalDevices);
 
 static std::string normalizeFirmwarePath(const std::string &rawPath)
 {
@@ -410,6 +411,46 @@ static void waitForDevicesReconnection(std::vector<DeviceUpgradeContext> &totalD
     std::cout << "Some devices have not reconnected yet, using pre-upgrade version for those." << std::endl;
 }
 
+static void rebootAllSuccessDevices(const std::vector<DeviceUpgradeContext> &totalDevices)
+{
+    std::lock_guard<std::recursive_mutex> lk(pipelineHolderMutex);
+    for (const auto &ctx : totalDevices)
+    {
+        if (ctx.result != UpgradeResult::Success)
+            continue;
+
+        // Find the online device by serial number so we can issue a reboot command.
+        for (const auto &iter : pipelineHolderMap)
+        {
+            if (iter.second->deviceInfo &&
+                iter.second->deviceInfo->serialNumber() == ctx.serialNumber)
+            {
+                try
+                {
+                    auto device = iter.second->pipeline->getDevice();
+                    if (device)
+                    {
+                        std::cout << "Rebooting device: " << ctx.serialNumber << "..." << std::endl;
+                        device->reboot();
+                    }
+                }
+                catch (const ob::Error &e)
+                {
+                    // Device may disconnect immediately after reboot; this is expected.
+                    std::cout << "Device " << ctx.serialNumber
+                              << " may have rebooted (" << e.getMessage() << ")" << std::endl;
+                }
+                catch (const std::exception &e)
+                {
+                    std::cerr << "Failed to reboot device " << ctx.serialNumber
+                              << ": " << e.what() << std::endl;
+                }
+                break;
+            }
+        }
+    }
+}
+
 void printSummary(std::vector<DeviceUpgradeContext> &totalDevices)
 {
     std::vector<DeviceUpgradeContext*> successDevices;
@@ -427,7 +468,16 @@ void printSummary(std::vector<DeviceUpgradeContext> &totalDevices)
         }
     }
 
+    // Wait for devices to come back after the firmware flash auto-reboots them.
     waitForDevicesReconnection(totalDevices);
+
+    // Perform a final active reboot on all successfully upgraded devices,
+    // matching the behaviour of multi_devices_firmware_update.
+    rebootAllSuccessDevices(totalDevices);
+
+    // Wait again for the devices to reconnect after the explicit reboot.
+    waitForDevicesReconnection(totalDevices);
+    updateDeviceInfoFromOnlineMap(totalDevices);
 
     std::cout << "\nUpgrade Summary:" << std::endl;
     std::cout << "==================================================" << std::endl;
