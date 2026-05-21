@@ -216,10 +216,11 @@ try
     upgradeRecoveryDevicesLinux(filePath, totalDevices, usedDevicePaths);
 #endif
 
-    printSummary(totalDevices);
-
-    // Suppress further device connect/disconnect logs while waiting for exit key.
+    // Suppress further device connect/disconnect logs before printing Summary
+    // so that background SDK events do not interleave with the final output.
     ctx.setDeviceChangedCallback([](std::shared_ptr<ob::DeviceList>, std::shared_ptr<ob::DeviceList>) {});
+
+    printSummary(totalDevices);
 
     std::cout << "\nPress any key to exit..." << std::endl;
     waitForKeyPress();
