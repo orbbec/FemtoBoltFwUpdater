@@ -918,10 +918,14 @@ static bool isFemtoBoltRecoveryDevice(const std::string &devicePath)
 
     std::string vendorPath = "/sys/class/scsi_generic/" + devName + "/device/vendor";
     std::ifstream fs(vendorPath);
-    if (!fs) return false;
+    if (!fs) {
+        std::cerr << "  [diag] Cannot open " << vendorPath << std::endl;
+        return false;
+    }
 
     std::string vendor;
     fs >> vendor;
+    std::cout << "  [diag] " << devicePath << " vendor=" << vendor << std::endl;
     return (vendor.size() >= 2 && vendor[0] == 'G' && vendor[1] == 'C');
 }
 
@@ -930,15 +934,21 @@ static std::vector<std::string> findRecoveryDevices(const std::set<std::string> 
     std::vector<std::string> result;
     const std::string devDir = "/dev/";
     DIR *dir = opendir(devDir.c_str());
-    if (!dir) return result;
+    if (!dir) {
+        std::cerr << "  [diag] Cannot open " << devDir << std::endl;
+        return result;
+    }
 
     struct dirent *entry;
     while ((entry = readdir(dir)) != nullptr) {
         std::string filename(entry->d_name);
         if (filename.compare(0, 2, "sg") == 0) {
             std::string devicePath = devDir + filename;
-            if (exclude.find(devicePath) == exclude.end() &&
-                isFemtoBoltRecoveryDevice(devicePath)) {
+            if (exclude.find(devicePath) != exclude.end()) {
+                std::cout << "  [diag] " << devicePath << " excluded (already used)" << std::endl;
+                continue;
+            }
+            if (isFemtoBoltRecoveryDevice(devicePath)) {
                 result.push_back(devicePath);
             }
         }
@@ -1008,23 +1018,34 @@ bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext 
         }
     }
 
-    // 2. Poll for the device to appear in recovery mode (up to 30 seconds)
+    // 2. Poll for the device to appear in recovery mode (up to 60 seconds)
     std::set<std::string> scanExclude = usedDevicePaths;
     scanExclude.insert(otherRecoveryDevices.begin(), otherRecoveryDevices.end());
 
+    if (!otherRecoveryDevices.empty()) {
+        std::cout << "  [diag] Excluding " << otherRecoveryDevices.size()
+                  << " pre-existing recovery device(s) from scan" << std::endl;
+    }
+
     std::string targetPath;
-    for (int retry = 0; retry < 60; ++retry)
+    for (int retry = 0; retry < 120; ++retry)
     {
         auto devices = findRecoveryDevices(scanExclude);
         if (!devices.empty()) {
             targetPath = devices.front();
             break;
         }
+        // Print progress every 10 seconds
+        if (retry > 0 && retry % 20 == 0) {
+            std::cout << "  Still waiting for recovery device... (" << retry / 2 << "s)" << std::endl;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
     if (targetPath.empty())
     {
+        std::cerr << "  [diag] No recovery device appeared within timeout." << std::endl;
+        std::cerr << "  [diag] Check: ls /dev/sg* ; cat /sys/class/scsi_generic/sg*/device/vendor" << std::endl;
         ctx.errorMsg = "No recovery device found";
         ctx.result = UpgradeResult::Failure;
         return false;
@@ -1096,18 +1117,22 @@ void upgradeRecoveryDevicesLinux(const std::string &filePath, std::vector<Device
 {
     std::cout << "Scanning for recovery mode devices..." << std::endl;
 
-    // Poll for recovery devices to appear (up to 20 seconds = 40 * 500ms)
+    // Poll for recovery devices to appear (up to 60 seconds = 120 * 500ms)
     std::vector<std::string> devicePaths;
-    for (int retry = 0; retry < 40; ++retry)
+    for (int retry = 0; retry < 120; ++retry)
     {
         devicePaths = findRecoveryDevices(usedDevicePaths);
         if (!devicePaths.empty()) break;
+        if (retry > 0 && retry % 20 == 0) {
+            std::cout << "  Still scanning for recovery devices... (" << retry / 2 << "s)" << std::endl;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
     if (devicePaths.empty())
     {
         std::cerr << "No recovery mode device found." << std::endl;
+        std::cerr << "  [diag] Check: ls /dev/sg* ; cat /sys/class/scsi_generic/sg*/device/vendor" << std::endl;
         return;
     }
 
