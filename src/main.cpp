@@ -908,28 +908,6 @@ int runCommandWithTimeoutLinux(const std::string &cmd, std::string &output, int 
     return -1;
 }
 
-static std::string findSgForSd(const std::string &sdPath)
-{
-    size_t pos = sdPath.rfind('/');
-    if (pos == std::string::npos) return "";
-    std::string sdName = sdPath.substr(pos + 1);
-    std::string sgDir = "/sys/block/" + sdName + "/device/scsi_generic/";
-    DIR *dir = opendir(sgDir.c_str());
-    if (!dir) return "";
-    struct dirent *entry;
-    std::string sgName;
-    while ((entry = readdir(dir)) != nullptr) {
-        std::string name(entry->d_name);
-        if (name.compare(0, 2, "sg") == 0) {
-            sgName = name;
-            break;
-        }
-    }
-    closedir(dir);
-    if (sgName.empty()) return "";
-    return "/dev/" + sgName;
-}
-
 static bool isFemtoBoltRecoveryDevice(const std::string &devicePath)
 {
     size_t pos = devicePath.rfind('/');
@@ -955,9 +933,6 @@ static bool isFemtoBoltRecoveryDevice(const std::string &devicePath)
 
 static std::vector<std::string> findRecoveryDevices(const std::set<std::string> &exclude)
 {
-    static bool firstScanDone = false;
-    static std::set<std::string> warnedNoSg;
-
     std::vector<std::string> result;
     const std::string devDir = "/dev/";
     DIR *dir = opendir(devDir.c_str());
@@ -966,8 +941,6 @@ static std::vector<std::string> findRecoveryDevices(const std::set<std::string> 
         return result;
     }
 
-    int sgCount = 0, sdCount = 0;
-
     struct dirent *entry;
     while ((entry = readdir(dir)) != nullptr) {
         std::string filename(entry->d_name);
@@ -975,43 +948,13 @@ static std::vector<std::string> findRecoveryDevices(const std::set<std::string> 
         bool isSd = (filename.compare(0, 2, "sd") == 0);
         if (!isSg && !isSd) continue;
 
-        if (isSg) sgCount++;
-        if (isSd) sdCount++;
-
         std::string devicePath = devDir + filename;
-        if (exclude.find(devicePath) != exclude.end()) {
-            if (!firstScanDone)
-                std::cout << "  [diag] " << devicePath << " excluded (already used)" << std::endl;
-            continue;
-        }
+        if (exclude.find(devicePath) != exclude.end()) continue;
         if (isFemtoBoltRecoveryDevice(devicePath)) {
-            if (isSg) {
-                result.push_back(devicePath);
-            } else {
-                std::string sgPath = findSgForSd(devicePath);
-                if (!sgPath.empty() && exclude.find(sgPath) == exclude.end()) {
-                    result.push_back(sgPath);
-                    if (!firstScanDone)
-                        std::cout << "  [diag] " << devicePath << " mapped to " << sgPath << std::endl;
-                } else if (warnedNoSg.find(devicePath) == warnedNoSg.end()) {
-                    warnedNoSg.insert(devicePath);
-                    std::cerr << "  [diag] " << devicePath
-                              << " is Femto Bolt but no corresponding sg* device found"
-                              << " (sg kernel module may not be loaded)" << std::endl;
-                }
-            }
+            result.push_back(devicePath);
         }
     }
     closedir(dir);
-
-    if (!firstScanDone) {
-        firstScanDone = true;
-        if (sgCount == 0 && sdCount > 0) {
-            std::cerr << "  [diag] Found " << sdCount << " block device(s) but 0 sg* devices."
-                      << " Try: sudo modprobe sg" << std::endl;
-        }
-    }
-
     return result;
 }
 
@@ -1104,7 +1047,6 @@ bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext 
     {
         std::cerr << "  [diag] No recovery device appeared within timeout." << std::endl;
         std::cerr << "  [diag] Check: ls /dev/sd* /dev/sg* ; cat /sys/block/sd*/device/vendor /sys/class/scsi_generic/sg*/device/vendor" << std::endl;
-        std::cerr << "  [diag] If no sg* devices exist, try: sudo modprobe sg" << std::endl;
         ctx.errorMsg = "No recovery device found";
         ctx.result = UpgradeResult::Failure;
         return false;
