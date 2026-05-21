@@ -218,6 +218,9 @@ try
 
     printSummary(totalDevices);
 
+    // Suppress further device connect/disconnect logs while waiting for exit key.
+    ctx.setDeviceChangedCallback([](std::shared_ptr<ob::DeviceList>, std::shared_ptr<ob::DeviceList>) {});
+
     std::cout << "\nPress any key to exit..." << std::endl;
     waitForKeyPress();
 
