@@ -57,7 +57,7 @@ void handleDeviceConnected(std::shared_ptr<ob::DeviceList> connectList);
 void handleDeviceDisconnected(std::shared_ptr<ob::DeviceList> disconnectList);
 void printDevicesInfo();
 void printSummary(std::vector<DeviceUpgradeContext> &totalDevices);
-static void rebootAllSuccessDevices(const std::vector<DeviceUpgradeContext> &totalDevices);
+
 
 static std::string normalizeFirmwarePath(const std::string &rawPath)
 {
@@ -336,129 +336,124 @@ void printDevicesInfo()
     }
 }
 
-static bool isValidSerialNumber(const std::string &sn)
-{
-    return !sn.empty() && sn != "Unknown" && sn != "CL000000000";
-}
-
-static void updateDeviceInfoFromOnlineMap(std::vector<DeviceUpgradeContext> &totalDevices)
+static std::set<std::string> getOnlineUIDs()
 {
     std::lock_guard<std::recursive_mutex> lk(pipelineHolderMutex);
-    std::set<std::string> assignedUIDs;
-    for (auto &ctx : totalDevices)
-    {
-        if (ctx.result != UpgradeResult::Success) continue;
-
-        // Try to match by serial number first
-        if (isValidSerialNumber(ctx.serialNumber))
-        {
-            for (const auto &iter : pipelineHolderMap)
-            {
-                if (iter.second->deviceInfo &&
-                    iter.second->deviceInfo->serialNumber() == ctx.serialNumber)
-                {
-                    ctx.firmwareVersion = iter.second->deviceInfo->firmwareVersion();
-                    assignedUIDs.insert(iter.first);
-                    break;
-                }
-            }
-        }
-        else
-        {
-            // Recovery mode device: match any unassigned online device with a valid SN
-            for (const auto &iter : pipelineHolderMap)
-            {
-                if (assignedUIDs.find(iter.first) != assignedUIDs.end())
-                    continue;
-                if (iter.second->deviceInfo &&
-                    isValidSerialNumber(iter.second->deviceInfo->serialNumber()))
-                {
-                    ctx.serialNumber = iter.second->deviceInfo->serialNumber();
-                    ctx.firmwareVersion = iter.second->deviceInfo->firmwareVersion();
-                    assignedUIDs.insert(iter.first);
-                    break;
-                }
-            }
-        }
+    std::set<std::string> uids;
+    for (const auto &iter : pipelineHolderMap) {
+        uids.insert(iter.first);
     }
+    return uids;
 }
 
-static void waitForDevicesReconnection(std::vector<DeviceUpgradeContext> &totalDevices)
+static bool waitForDeviceByCriteria(const std::string &expectedSN, int timeoutSeconds, std::string &outSN, std::string &outFW)
 {
-    std::vector<DeviceUpgradeContext*> successDevices;
-    for (auto &ctx : totalDevices)
-    {
-        if (ctx.result == UpgradeResult::Success)
-            successDevices.push_back(&ctx);
-    }
-    if (successDevices.empty()) return;
-
-    std::cout << "\nWaiting for upgraded devices to reconnect..." << std::endl;
-    // Wait up to 60 seconds (120 * 500ms) for devices to reboot and re-enumerate
-    for (int retry = 0; retry < 120; ++retry)
-    {
-        updateDeviceInfoFromOnlineMap(totalDevices);
-
-        bool allResolved = true;
-        for (const auto *ctx : successDevices)
+    int retries = timeoutSeconds * 2;
+    for (int i = 0; i < retries; ++i) {
         {
-            if (!isValidSerialNumber(ctx->serialNumber) || ctx->firmwareVersion.empty())
-            {
-                allResolved = false;
-                break;
+            std::lock_guard<std::recursive_mutex> lk(pipelineHolderMutex);
+            for (const auto &iter : pipelineHolderMap) {
+                auto di = iter.second->deviceInfo;
+                if (!di) continue;
+
+                if (expectedSN == "Unknown" || di->serialNumber() == expectedSN) {
+                    outSN = di->serialNumber();
+                    outFW = di->firmwareVersion();
+                    return true;
+                }
             }
-        }
-        if (allResolved)
-        {
-            std::cout << "All upgraded devices are back online." << std::endl;
-            return;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
-    std::cout << "Some devices have not reconnected yet, using pre-upgrade version for those." << std::endl;
+    return false;
 }
 
-static void rebootAllSuccessDevices(const std::vector<DeviceUpgradeContext> &totalDevices)
+static bool waitForNewDevice(const std::set<std::string> &excludeUIDs, int timeoutSeconds, std::string &outSN, std::string &outFW)
 {
-    std::lock_guard<std::recursive_mutex> lk(pipelineHolderMutex);
-    for (const auto &ctx : totalDevices)
-    {
-        if (ctx.result != UpgradeResult::Success)
-            continue;
-
-        // Skip devices that already reconnected with a valid serial number and firmware version.
-        if (isValidSerialNumber(ctx.serialNumber) && !ctx.firmwareVersion.empty())
-            continue;
-
-        // Find the online device by serial number so we can issue a reboot command.
-        for (const auto &iter : pipelineHolderMap)
+    int retries = timeoutSeconds * 2;
+    for (int i = 0; i < retries; ++i) {
         {
-            if (iter.second->deviceInfo &&
-                iter.second->deviceInfo->serialNumber() == ctx.serialNumber)
-            {
-                try
-                {
-                    auto device = iter.second->pipeline->getDevice();
-                    if (device)
-                    {
-                        std::cout << "Rebooting device: " << ctx.serialNumber << "..." << std::endl;
-                        device->reboot();
-                    }
+            std::lock_guard<std::recursive_mutex> lk(pipelineHolderMutex);
+            for (const auto &iter : pipelineHolderMap) {
+                if (excludeUIDs.find(iter.first) != excludeUIDs.end()) continue;
+                auto di = iter.second->deviceInfo;
+                if (di) {
+                    outSN = di->serialNumber();
+                    outFW = di->firmwareVersion();
+                    return true;
                 }
-                catch (const ob::Error &e)
-                {
-                    // Device may disconnect immediately after reboot; this is expected.
-                    std::cout << "Device " << ctx.serialNumber
-                              << " may have rebooted (" << e.getMessage() << ")" << std::endl;
-                }
-                catch (const std::exception &e)
-                {
-                    std::cerr << "Failed to reboot device " << ctx.serialNumber
-                              << ": " << e.what() << std::endl;
-                }
-                break;
             }
         }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    return false;
+}
+
+static void rebootDeviceBySN(const std::string &sn)
+{
+    std::lock_guard<std::recursive_mutex> lk(pipelineHolderMutex);
+    for (const auto &iter : pipelineHolderMap) {
+        auto di = iter.second->deviceInfo;
+        if (di && di->serialNumber() == sn) {
+            try {
+                auto device = iter.second->pipeline->getDevice();
+                if (device) {
+                    std::cout << "Rebooting device: " << sn << "..." << std::endl;
+                    device->reboot();
+                }
+            }
+            catch (const ob::Error &e) {
+                std::cout << "Device " << sn
+                          << " may have rebooted (" << e.getMessage() << ")" << std::endl;
+            }
+            catch (const std::exception &e) {
+                std::cerr << "Failed to reboot device " << sn
+                          << ": " << e.what() << std::endl;
+            }
+            break;
+        }
+    }
+}
+
+static void finalizeDeviceAfterUpgrade(DeviceUpgradeContext &ctx, const std::set<std::string> &preFlashUIDs)
+{
+    if (ctx.result != UpgradeResult::Success) return;
+
+    std::cout << "\nWaiting for device to reconnect after upgrade..." << std::endl;
+
+    std::string sn, fw;
+    // Step 1: Wait for device to auto-reboot back to normal mode after flash.
+    bool found = false;
+    if (ctx.serialNumber != "Unknown") {
+        found = waitForDeviceByCriteria(ctx.serialNumber, 60, sn, fw);
+    } else {
+        found = waitForNewDevice(preFlashUIDs, 60, sn, fw);
+    }
+    if (!found) {
+        std::cout << "Warning: Device did not reconnect within timeout." << std::endl;
+        return;
+    }
+
+    ctx.serialNumber = sn;
+    ctx.firmwareVersion = fw;
+
+    // Step 2: Always perform an active reboot to ensure the serial number stabilizes.
+    std::cout << "Device reconnected (SN: " << ctx.serialNumber
+              << "). Performing final reboot..." << std::endl;
+    rebootDeviceBySN(ctx.serialNumber);
+
+    // Step 3: Wait for device to come back after the explicit reboot.
+    // Snapshot current UIDs so we can detect the newly reconnected device.
+    std::set<std::string> uidsBefore = getOnlineUIDs();
+
+    std::cout << "Waiting for device to reconnect after final reboot..." << std::endl;
+    if (waitForNewDevice(uidsBefore, 60, sn, fw)) {
+        ctx.serialNumber = sn;
+        ctx.firmwareVersion = fw;
+        std::cout << "Device back online (SN: " << ctx.serialNumber
+                  << ", FW: " << ctx.firmwareVersion << ")." << std::endl;
+    } else {
+        std::cout << "Warning: Device did not reconnect after final reboot." << std::endl;
     }
 }
 
@@ -478,17 +473,6 @@ void printSummary(std::vector<DeviceUpgradeContext> &totalDevices)
             failedDevices.push_back(&ctx);
         }
     }
-
-    // Wait for devices to come back after the firmware flash auto-reboots them.
-    waitForDevicesReconnection(totalDevices);
-
-    // Perform a final active reboot on all successfully upgraded devices,
-    // matching the behaviour of multi_devices_firmware_update.
-    rebootAllSuccessDevices(totalDevices);
-
-    // Wait again for the devices to reconnect after the explicit reboot.
-    waitForDevicesReconnection(totalDevices);
-    updateDeviceInfoFromOnlineMap(totalDevices);
 
     std::cout << "\nUpgrade Summary:" << std::endl;
     std::cout << "==================================================" << std::endl;
@@ -627,6 +611,9 @@ bool upgradeSingleDeviceWindows(const std::string &filePath, DeviceUpgradeContex
         ~DiskGuard() { if (set) set->erase(disk); }
     } diskGuard(&usedDiskSet, diskNumber);
 
+    // Snapshot online UIDs before flash so finalizeDeviceAfterUpgrade can detect the reconnected device.
+    std::set<std::string> preFlashUIDs = getOnlineUIDs();
+
     // 3. Execute the firmware upgrade tool synchronously with timeout (5 minutes)
     std::string cmd = "USBDownloadTool.exe \"" + filePath + "\" " + std::to_string(diskNumber);
     std::cout << "Executing: " << cmd << std::endl;
@@ -663,6 +650,7 @@ bool upgradeSingleDeviceWindows(const std::string &filePath, DeviceUpgradeContex
     }
 
     ctx.result = UpgradeResult::Success;
+    finalizeDeviceAfterUpgrade(ctx, preFlashUIDs);
     return true;
 }
 
@@ -692,6 +680,9 @@ void upgradeRecoveryDevicesWindows(const std::string &filePath, std::vector<Devi
             ctx.firmwareVersion = "Unknown";
 
             std::cout << "\nUpgrading recovery device: " << deviceIndex << " - disk " << (char)diskNumber << std::endl;
+
+            // Snapshot online UIDs before flash so finalizeDeviceAfterUpgrade can detect the reconnected device.
+            std::set<std::string> preFlashUIDs = getOnlineUIDs();
 
             std::string cmd = "USBDownloadTool.exe \"" + filePath + "\" " + std::to_string(diskNumber);
             std::cout << "Executing: " << cmd << std::endl;
@@ -726,6 +717,9 @@ void upgradeRecoveryDevicesWindows(const std::string &filePath, std::vector<Devi
                 ctx.result = UpgradeResult::Success;
             }
             totalDevices.push_back(ctx);
+            if (ctx.result == UpgradeResult::Success) {
+                finalizeDeviceAfterUpgrade(totalDevices.back(), preFlashUIDs);
+            }
         }
 
         if (!handle && --retryTimes == 0)
@@ -1051,6 +1045,9 @@ bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext 
 
     std::cout << "Recovery device found at: " << targetPath << std::endl;
 
+    // Snapshot online UIDs before flash so finalizeDeviceAfterUpgrade can detect the reconnected device.
+    std::set<std::string> preFlashUIDs = getOnlineUIDs();
+
     // 4. Execute the firmware upgrade tool synchronously with timeout (5 minutes)
     std::string cmd = "./usbdownload \"" + targetPath + "\" \"" + filePath + "\"";
     std::cout << "Executing: " << cmd << std::endl;
@@ -1091,6 +1088,7 @@ bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext 
     }
 
     ctx.result = UpgradeResult::Success;
+    finalizeDeviceAfterUpgrade(ctx, preFlashUIDs);
     return true;
 }
 
@@ -1125,6 +1123,9 @@ void upgradeRecoveryDevicesLinux(const std::string &filePath, std::vector<Device
         ctx.firmwareVersion = "Unknown";
 
         std::cout << "\nUpgrading recovery device: " << deviceIndex << " - " << path << std::endl;
+
+        // Snapshot online UIDs before flash so finalizeDeviceAfterUpgrade can detect the reconnected device.
+        std::set<std::string> preFlashUIDs = getOnlineUIDs();
 
         std::string cmd = "./usbdownload \"" + path + "\" \"" + filePath + "\"";
         std::cout << "Executing: " << cmd << std::endl;
@@ -1166,6 +1167,9 @@ void upgradeRecoveryDevicesLinux(const std::string &filePath, std::vector<Device
             }
         }
         totalDevices.push_back(ctx);
+        if (ctx.result == UpgradeResult::Success) {
+            finalizeDeviceAfterUpgrade(totalDevices.back(), preFlashUIDs);
+        }
     }
 }
 #endif
