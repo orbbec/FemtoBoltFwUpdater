@@ -665,16 +665,13 @@ void upgradeRecoveryDevicesWindows(const std::string &filePath, std::vector<Devi
 
     int retryTimes = 10;
     int deviceIndex = 0;
-    std::set<int> attemptedDisks;
     while (true)
     {
         HANDLE handle = NULL;
         int devState = DEV_STATE_UNKNOWN;
         int diskNumber = 0;
 
-        std::set<int> exclude = usedDiskSet;
-        exclude.insert(attemptedDisks.begin(), attemptedDisks.end());
-        handle = USB_ScsiFindDevice(&devState, &diskNumber, exclude);
+        handle = USB_ScsiFindDevice(&devState, &diskNumber, usedDiskSet);
 
         if (handle)
         {
@@ -698,8 +695,11 @@ void upgradeRecoveryDevicesWindows(const std::string &filePath, std::vector<Devi
             {
                 ctx.errorMsg = "Failed to execute USBDownloadTool.exe or process creation failed";
                 ctx.result = UpgradeResult::Failure;
+                totalDevices.push_back(ctx);
+                continue;
             }
-            else if (status != 0)
+
+            if (status != 0)
             {
                 ctx.errorMsg = "Firmware upgrade tool returned error code: " + std::to_string(status);
                 ctx.result = UpgradeResult::Failure;
@@ -719,13 +719,6 @@ void upgradeRecoveryDevicesWindows(const std::string &filePath, std::vector<Devi
                 ctx.result = UpgradeResult::Success;
             }
             totalDevices.push_back(ctx);
-
-            // Release disk number so it can be reused by other devices.
-            usedDiskSet.erase(diskNumber);
-            if (ctx.result != UpgradeResult::Success)
-            {
-                attemptedDisks.insert(diskNumber);
-            }
         }
 
         if (!handle && --retryTimes == 0)
@@ -914,8 +907,8 @@ static bool isFemtoBoltRecoveryDevice(const std::string &devicePath)
     std::string vendorPath = "/sys/class/scsi_generic/" + devName + "/device/vendor";
     std::ifstream fs(vendorPath);
     if (!fs) {
-        // Fallback: try block device sysfs (for /dev/sd*)
-        vendorPath = "/sys/block/" + devName + "/device/vendor";
+        // Fallback: try scsi_disk sysfs (for /dev/sd*)
+        vendorPath = "/sys/class/scsi_disk/" + devName + "/device/vendor";
         fs.open(vendorPath);
         if (!fs) return false;
     }
