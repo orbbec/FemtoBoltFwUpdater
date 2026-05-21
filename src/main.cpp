@@ -18,9 +18,6 @@
 #include <windows.h>
 #else
 #include <dirent.h>
-#include <fcntl.h>
-#include <signal.h>
-#include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -819,93 +816,29 @@ int runCommandWithTimeout(const std::string &cmd, std::string &output, DWORD tim
 #ifndef WIN32
 int runCommandWithTimeoutLinux(const std::string &cmd, std::string &output, int timeoutMs)
 {
-    int stdoutPipe[2];
-    if (pipe(stdoutPipe) == -1) return -1;
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(stdoutPipe[0]);
-        close(stdoutPipe[1]);
-        return -1;
-    }
-    if (pid == 0) {
-        close(stdoutPipe[0]);
-        dup2(stdoutPipe[1], STDOUT_FILENO);
-        dup2(stdoutPipe[1], STDERR_FILENO);
-        close(stdoutPipe[1]);
-        execl("/bin/sh", "sh", "-c", cmd.c_str(), (char*)NULL);
-        _exit(127);
-    }
-    close(stdoutPipe[1]);
-
-    int flags = fcntl(stdoutPipe[0], F_GETFL, 0);
-    fcntl(stdoutPipe[0], F_SETFL, flags | O_NONBLOCK);
-
-    auto start = std::chrono::steady_clock::now();
-    char buf[1024];
-    int exitCode = -1;
-    bool processExited = false;
-    int status = 0;
-
-    while (true) {
-        pid_t result = waitpid(pid, &status, WNOHANG);
-        if (result == -1) {
-            // Child may have been reaped or interrupted; drain remaining output before giving up.
-            ssize_t n;
-            while ((n = read(stdoutPipe[0], buf, sizeof(buf) - 1)) > 0) {
-                buf[n] = '\0';
-                output += buf;
-                std::cout << buf << std::flush;
-            }
-            break;
-        }
-
-        if (result == pid) {
-            processExited = true;
-            if (WIFEXITED(status)) {
-                exitCode = WEXITSTATUS(status);
-            } else {
-                exitCode = -1;
-            }
-        }
-
-        ssize_t n = read(stdoutPipe[0], buf, sizeof(buf) - 1);
-        if (n > 0) {
-            buf[n] = '\0';
+    // Use popen + blocking fgets to match the main branch's proven approach.
+    // The polling loop + sleep pattern previously used caused pipe buffer
+    // backpressure that could stall usbdownload and corrupt the flash on ARM64.
+    auto future = std::async(std::launch::async, [&]() {
+        FILE *pipe = popen(cmd.c_str(), "r");
+        if (!pipe) return -1;
+        char buf[1024];
+        while (fgets(buf, sizeof(buf), pipe) != NULL) {
             output += buf;
             std::cout << buf << std::flush;
         }
+        int status = pclose(pipe);
+        if (WIFEXITED(status)) return WEXITSTATUS(status);
+        return -1;
+    });
 
-        if (processExited) {
-            while (true) {
-                n = read(stdoutPipe[0], buf, sizeof(buf) - 1);
-                if (n > 0) {
-                    buf[n] = '\0';
-                    output += buf;
-                    std::cout << buf << std::flush;
-                } else {
-                    break;
-                }
-            }
-            close(stdoutPipe[0]);
-            return exitCode;
-        }
-
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - start).count();
-        if (elapsed >= timeoutMs) {
-            std::cerr << "Command timed out after " << timeoutMs << " ms, terminating process..." << std::endl;
-            kill(pid, SIGKILL);
-            waitpid(pid, &status, 0);
-            close(stdoutPipe[0]);
-            return -1;
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    auto waitStatus = future.wait_for(std::chrono::milliseconds(timeoutMs));
+    if (waitStatus == std::future_status::timeout)
+    {
+        std::cerr << "Command timed out after " << timeoutMs << " ms." << std::endl;
+        return -1;
     }
-
-    close(stdoutPipe[0]);
-    return -1;
+    return future.get();
 }
 
 static bool isFemtoBoltRecoveryDevice(const std::string &devicePath)
