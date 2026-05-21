@@ -605,6 +605,17 @@ bool upgradeSingleDeviceWindows(const std::string &filePath, DeviceUpgradeContex
         return false;
     }
 
+    // The device will reboot back to normal mode after the flash completes,
+    // causing its SCSI disk to disappear. We must remove the disk number from
+    // usedDiskSet on exit so that another device can reuse the same disk letter.
+    struct DiskGuard
+    {
+        std::set<int> *set;
+        int disk;
+        DiskGuard(std::set<int> *s, int d) : set(s), disk(d) {}
+        ~DiskGuard() { if (set) set->erase(disk); }
+    } diskGuard(&usedDiskSet, diskNumber);
+
     // 3. Execute the firmware upgrade tool synchronously with timeout (5 minutes)
     std::string cmd = "USBDownloadTool.exe \"" + filePath + "\" " + std::to_string(diskNumber);
     std::cout << "Executing: " << cmd << std::endl;
@@ -1024,6 +1035,18 @@ bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext 
     }
 
     usedDevicePaths.insert(targetPath);
+
+    // The device will reboot back to normal mode after the flash completes,
+    // causing its /dev node to disappear. We must remove the path from
+    // usedDevicePaths on exit so that another device can reuse the same node.
+    struct PathGuard
+    {
+        std::set<std::string> *set;
+        std::string path;
+        PathGuard(std::set<std::string> *s, const std::string &p) : set(s), path(p) {}
+        ~PathGuard() { if (set) set->erase(path); }
+    } pathGuard(&usedDevicePaths, targetPath);
+
     std::cout << "Recovery device found at: " << targetPath << std::endl;
 
     // 4. Execute the firmware upgrade tool synchronously with timeout (5 minutes)
