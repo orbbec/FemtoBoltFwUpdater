@@ -9,9 +9,11 @@
 #include <mutex>
 #include <set>
 #include <vector>
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <fstream>
+#include <future>
 
 #ifdef WIN32
 #include <conio.h>
