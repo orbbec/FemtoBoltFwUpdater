@@ -946,19 +946,18 @@ static bool isFemtoBoltRecoveryDevice(const std::string &devicePath)
     }
 
     std::ifstream fs(vendorPath);
-    if (!fs) {
-        std::cerr << "  [diag] Cannot open " << vendorPath << std::endl;
-        return false;
-    }
+    if (!fs) return false;
 
     std::string vendor;
     fs >> vendor;
-    std::cout << "  [diag] " << devicePath << " vendor=" << vendor << std::endl;
     return (vendor.size() >= 2 && vendor[0] == 'G' && vendor[1] == 'C');
 }
 
 static std::vector<std::string> findRecoveryDevices(const std::set<std::string> &exclude)
 {
+    static bool firstScanDone = false;
+    static std::set<std::string> warnedNoSg;
+
     std::vector<std::string> result;
     const std::string devDir = "/dev/";
     DIR *dir = opendir(devDir.c_str());
@@ -967,6 +966,8 @@ static std::vector<std::string> findRecoveryDevices(const std::set<std::string> 
         return result;
     }
 
+    int sgCount = 0, sdCount = 0;
+
     struct dirent *entry;
     while ((entry = readdir(dir)) != nullptr) {
         std::string filename(entry->d_name);
@@ -974,28 +975,43 @@ static std::vector<std::string> findRecoveryDevices(const std::set<std::string> 
         bool isSd = (filename.compare(0, 2, "sd") == 0);
         if (!isSg && !isSd) continue;
 
+        if (isSg) sgCount++;
+        if (isSd) sdCount++;
+
         std::string devicePath = devDir + filename;
         if (exclude.find(devicePath) != exclude.end()) {
-            std::cout << "  [diag] " << devicePath << " excluded (already used)" << std::endl;
+            if (!firstScanDone)
+                std::cout << "  [diag] " << devicePath << " excluded (already used)" << std::endl;
             continue;
         }
         if (isFemtoBoltRecoveryDevice(devicePath)) {
             if (isSg) {
                 result.push_back(devicePath);
             } else {
-                // For sd* devices, look up the corresponding sg* for SCSI pass-through.
                 std::string sgPath = findSgForSd(devicePath);
                 if (!sgPath.empty() && exclude.find(sgPath) == exclude.end()) {
                     result.push_back(sgPath);
-                    std::cout << "  [diag] " << devicePath << " mapped to " << sgPath << std::endl;
-                } else {
+                    if (!firstScanDone)
+                        std::cout << "  [diag] " << devicePath << " mapped to " << sgPath << std::endl;
+                } else if (warnedNoSg.find(devicePath) == warnedNoSg.end()) {
+                    warnedNoSg.insert(devicePath);
                     std::cerr << "  [diag] " << devicePath
-                              << " is Femto Bolt but no corresponding sg* device found (sg kernel module may not be loaded)" << std::endl;
+                              << " is Femto Bolt but no corresponding sg* device found"
+                              << " (sg kernel module may not be loaded)" << std::endl;
                 }
             }
         }
     }
     closedir(dir);
+
+    if (!firstScanDone) {
+        firstScanDone = true;
+        if (sgCount == 0 && sdCount > 0) {
+            std::cerr << "  [diag] Found " << sdCount << " block device(s) but 0 sg* devices."
+                      << " Try: sudo modprobe sg" << std::endl;
+        }
+    }
+
     return result;
 }
 
