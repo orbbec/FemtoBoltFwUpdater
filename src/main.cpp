@@ -908,15 +908,43 @@ int runCommandWithTimeoutLinux(const std::string &cmd, std::string &output, int 
     return -1;
 }
 
+static std::string findSgForSd(const std::string &sdPath)
+{
+    size_t pos = sdPath.rfind('/');
+    if (pos == std::string::npos) return "";
+    std::string sdName = sdPath.substr(pos + 1);
+    std::string sgDir = "/sys/block/" + sdName + "/device/scsi_generic/";
+    DIR *dir = opendir(sgDir.c_str());
+    if (!dir) return "";
+    struct dirent *entry;
+    std::string sgName;
+    while ((entry = readdir(dir)) != nullptr) {
+        std::string name(entry->d_name);
+        if (name.compare(0, 2, "sg") == 0) {
+            sgName = name;
+            break;
+        }
+    }
+    closedir(dir);
+    if (sgName.empty()) return "";
+    return "/dev/" + sgName;
+}
+
 static bool isFemtoBoltRecoveryDevice(const std::string &devicePath)
 {
-    // Only /dev/sg* supports SCSI PASS THROUGH, which usbdownload requires.
     size_t pos = devicePath.rfind('/');
     if (pos == std::string::npos) return false;
     std::string devName = devicePath.substr(pos + 1);
-    if (devName.compare(0, 2, "sg") != 0) return false;
 
-    std::string vendorPath = "/sys/class/scsi_generic/" + devName + "/device/vendor";
+    std::string vendorPath;
+    if (devName.compare(0, 2, "sg") == 0) {
+        vendorPath = "/sys/class/scsi_generic/" + devName + "/device/vendor";
+    } else if (devName.compare(0, 2, "sd") == 0) {
+        vendorPath = "/sys/block/" + devName + "/device/vendor";
+    } else {
+        return false;
+    }
+
     std::ifstream fs(vendorPath);
     if (!fs) {
         std::cerr << "  [diag] Cannot open " << vendorPath << std::endl;
@@ -942,14 +970,28 @@ static std::vector<std::string> findRecoveryDevices(const std::set<std::string> 
     struct dirent *entry;
     while ((entry = readdir(dir)) != nullptr) {
         std::string filename(entry->d_name);
-        if (filename.compare(0, 2, "sg") == 0) {
-            std::string devicePath = devDir + filename;
-            if (exclude.find(devicePath) != exclude.end()) {
-                std::cout << "  [diag] " << devicePath << " excluded (already used)" << std::endl;
-                continue;
-            }
-            if (isFemtoBoltRecoveryDevice(devicePath)) {
+        bool isSg = (filename.compare(0, 2, "sg") == 0);
+        bool isSd = (filename.compare(0, 2, "sd") == 0);
+        if (!isSg && !isSd) continue;
+
+        std::string devicePath = devDir + filename;
+        if (exclude.find(devicePath) != exclude.end()) {
+            std::cout << "  [diag] " << devicePath << " excluded (already used)" << std::endl;
+            continue;
+        }
+        if (isFemtoBoltRecoveryDevice(devicePath)) {
+            if (isSg) {
                 result.push_back(devicePath);
+            } else {
+                // For sd* devices, look up the corresponding sg* for SCSI pass-through.
+                std::string sgPath = findSgForSd(devicePath);
+                if (!sgPath.empty() && exclude.find(sgPath) == exclude.end()) {
+                    result.push_back(sgPath);
+                    std::cout << "  [diag] " << devicePath << " mapped to " << sgPath << std::endl;
+                } else {
+                    std::cerr << "  [diag] " << devicePath
+                              << " is Femto Bolt but no corresponding sg* device found (sg kernel module may not be loaded)" << std::endl;
+                }
             }
         }
     }
@@ -1045,7 +1087,8 @@ bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext 
     if (targetPath.empty())
     {
         std::cerr << "  [diag] No recovery device appeared within timeout." << std::endl;
-        std::cerr << "  [diag] Check: ls /dev/sg* ; cat /sys/class/scsi_generic/sg*/device/vendor" << std::endl;
+        std::cerr << "  [diag] Check: ls /dev/sd* /dev/sg* ; cat /sys/block/sd*/device/vendor /sys/class/scsi_generic/sg*/device/vendor" << std::endl;
+        std::cerr << "  [diag] If no sg* devices exist, try: sudo modprobe sg" << std::endl;
         ctx.errorMsg = "No recovery device found";
         ctx.result = UpgradeResult::Failure;
         return false;
@@ -1132,7 +1175,8 @@ void upgradeRecoveryDevicesLinux(const std::string &filePath, std::vector<Device
     if (devicePaths.empty())
     {
         std::cerr << "No recovery mode device found." << std::endl;
-        std::cerr << "  [diag] Check: ls /dev/sg* ; cat /sys/class/scsi_generic/sg*/device/vendor" << std::endl;
+        std::cerr << "  [diag] Check: ls /dev/sd* /dev/sg* ; cat /sys/block/sd*/device/vendor /sys/class/scsi_generic/sg*/device/vendor" << std::endl;
+        std::cerr << "  [diag] If no sg* devices exist, try: sudo modprobe sg" << std::endl;
         return;
     }
 
