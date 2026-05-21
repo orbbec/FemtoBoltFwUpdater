@@ -914,8 +914,8 @@ static bool isFemtoBoltRecoveryDevice(const std::string &devicePath)
     std::string vendorPath = "/sys/class/scsi_generic/" + devName + "/device/vendor";
     std::ifstream fs(vendorPath);
     if (!fs) {
-        // Fallback: try scsi_disk sysfs (for /dev/sd*)
-        vendorPath = "/sys/class/scsi_disk/" + devName + "/device/vendor";
+        // Fallback: try block device sysfs (for /dev/sd*)
+        vendorPath = "/sys/block/" + devName + "/device/vendor";
         fs.open(vendorPath);
         if (!fs) return false;
     }
