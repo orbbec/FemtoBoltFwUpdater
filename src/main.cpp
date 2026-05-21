@@ -27,11 +27,18 @@
 
 #define ESC 27
 
-typedef struct PipelineHolder_t
+struct PipelineHolder
 {
     std::shared_ptr<ob::Pipeline> pipeline;
     std::shared_ptr<ob::DeviceInfo> deviceInfo;
-} PipelineHolder;
+};
+
+enum class UpgradeResult
+{
+    Pending,
+    Success,
+    Failure
+};
 
 struct DeviceUpgradeContext
 {
@@ -39,8 +46,7 @@ struct DeviceUpgradeContext
     std::string serialNumber;
     std::string name;
     std::string firmwareVersion;
-    bool finalSuccess = false;
-    bool finalFailure = false;
+    UpgradeResult result = UpgradeResult::Pending;
     std::string errorMsg;
 };
 
@@ -51,6 +57,54 @@ void handleDeviceConnected(std::shared_ptr<ob::DeviceList> connectList);
 void handleDeviceDisconnected(std::shared_ptr<ob::DeviceList> disconnectList);
 void printDevicesInfo();
 void printSummary(std::vector<DeviceUpgradeContext> &totalDevices);
+
+static std::string normalizeFirmwarePath(const std::string &rawPath)
+{
+    std::string path = rawPath;
+    // PowerShell trailing-backslash escaping (e.g. "path\") leaves a trailing '"' in argv[1].
+    while (!path.empty() && path.back() == '"') {
+        path.pop_back();
+    }
+    // Normalize trailing backslash to forward slash.
+    if (!path.empty() && path.back() == '\\') {
+        path.back() = '/';
+    }
+    // Ensure directory paths end with '/' but do not append to .zip files.
+    if (!path.empty() && path.back() != '/') {
+        if (path.size() < 4) {
+            path += '/';
+        } else {
+            std::string ext = path.substr(path.size() - 4);
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            if (ext != ".zip") {
+                path += '/';
+            }
+        }
+    }
+    return path;
+}
+
+#ifdef WIN32
+static int waitForKeyPress()
+{
+    while (true) {
+        if (_kbhit()) {
+            return _getch();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+#else
+static int waitForKeyPress()
+{
+    while (true) {
+        if (kbhit()) {
+            return getch();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+#endif
 
 #ifdef WIN32
 bool upgradeSingleDeviceWindows(const std::string &filePath, DeviceUpgradeContext &ctx, std::set<int> &usedDiskSet);
@@ -70,29 +124,7 @@ try
         return -1;
     }
 
-    std::string filePath = std::string(argv[1]);
-    // PowerShell trailing-backslash escaping (e.g. "path\") leaves a trailing '"' in argv[1].
-    // Strip any trailing quotes first.
-    while (!filePath.empty() && filePath.back() == '"') {
-        filePath.pop_back();
-    }
-    // Normalize trailing backslash to forward slash so we only have one separator to check.
-    if (!filePath.empty() && filePath.back() == '\\') {
-        filePath.back() = '/';
-    }
-    // Ensure filePath ends with '/' for directory-based firmware path (original behavior).
-    // Do not append '/' if the path points to a .zip file, since USBDownloadTool also accepts zip directly.
-    if (!filePath.empty() && filePath.back() != '/') {
-        if (filePath.size() < 4) {
-            filePath += '/';
-        } else {
-            std::string ext = filePath.substr(filePath.size() - 4);
-            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-            if (ext != ".zip") {
-                filePath += '/';
-            }
-        }
-    }
+    std::string filePath = normalizeFirmwarePath(argv[1]);
     // create context
     ob::Context ctx;
 
@@ -140,29 +172,14 @@ try
     }
     while (true)
     {
-#ifdef WIN32
-        if (_kbhit())
+        int key = waitForKeyPress();
+        if (key == ESC)
         {
-            int key = _getch();
-#else
-        if (kbhit())
-        {
-            int key = getch();
-#endif
-            // Press the esc key to exit
-            if (key == ESC)
-            {
-                return 0;
-            }
-
-            if (key == 'u' || key == 'U')
-            {
-                break;
-            }
+            return 0;
         }
-        else
+        if (key == 'u' || key == 'U')
         {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            break;
         }
     }
 
@@ -201,23 +218,7 @@ try
     printSummary(totalDevices);
 
     std::cout << "\nPress any key to exit..." << std::endl;
-    while (true)
-    {
-#ifdef WIN32
-        if (_kbhit())
-        {
-            _getch();
-            break;
-        }
-#else
-        if (kbhit())
-        {
-            getch();
-            break;
-        }
-#endif
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
+    waitForKeyPress();
 
     return 0;
 }
@@ -333,54 +334,13 @@ static std::string getLatestFirmwareVersionBySN(const std::string &serialNumber)
     return "";
 }
 
-static void waitForDevicesReconnection(const std::vector<DeviceUpgradeContext*> &successDevices)
-{
-    if (successDevices.empty()) return;
-    std::cout << "\nWaiting for upgraded devices to reconnect..." << std::endl;
-    // Wait up to 30 seconds (60 * 500ms) for devices to reboot and re-enumerate
-    for (int retry = 0; retry < 60; ++retry)
-    {
-        bool allOnline = true;
-        int unknownCount = 0;
-        int onlineCount = 0;
-        for (const auto *ctx : successDevices)
-        {
-            if (ctx->serialNumber == "Unknown")
-            {
-                unknownCount++;
-            }
-            else if (getLatestFirmwareVersionBySN(ctx->serialNumber).empty())
-            {
-                allOnline = false;
-                break;
-            }
-        }
-        if (unknownCount > 0)
-        {
-            std::lock_guard<std::recursive_mutex> lk(pipelineHolderMutex);
-            onlineCount = static_cast<int>(pipelineHolderMap.size());
-            if (onlineCount < unknownCount)
-            {
-                allOnline = false;
-            }
-        }
-        if (allOnline)
-        {
-            std::cout << "All upgraded devices are back online." << std::endl;
-            return;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }
-    std::cout << "Some devices have not reconnected yet, using pre-upgrade version for those." << std::endl;
-}
-
 static void updateDeviceInfoFromOnlineMap(std::vector<DeviceUpgradeContext> &totalDevices)
 {
     std::lock_guard<std::recursive_mutex> lk(pipelineHolderMutex);
     std::set<std::string> assignedUIDs;
     for (auto &ctx : totalDevices)
     {
-        if (!ctx.finalSuccess) continue;
+        if (ctx.result != UpgradeResult::Success) continue;
 
         // Try to match by serial number first
         if (ctx.serialNumber != "Unknown")
@@ -415,6 +375,41 @@ static void updateDeviceInfoFromOnlineMap(std::vector<DeviceUpgradeContext> &tot
     }
 }
 
+static void waitForDevicesReconnection(std::vector<DeviceUpgradeContext> &totalDevices)
+{
+    std::vector<DeviceUpgradeContext*> successDevices;
+    for (auto &ctx : totalDevices)
+    {
+        if (ctx.result == UpgradeResult::Success)
+            successDevices.push_back(&ctx);
+    }
+    if (successDevices.empty()) return;
+
+    std::cout << "\nWaiting for upgraded devices to reconnect..." << std::endl;
+    // Wait up to 60 seconds (120 * 500ms) for devices to reboot and re-enumerate
+    for (int retry = 0; retry < 120; ++retry)
+    {
+        updateDeviceInfoFromOnlineMap(totalDevices);
+
+        bool allResolved = true;
+        for (const auto *ctx : successDevices)
+        {
+            if (ctx->serialNumber == "Unknown" || ctx->firmwareVersion.empty())
+            {
+                allResolved = false;
+                break;
+            }
+        }
+        if (allResolved)
+        {
+            std::cout << "All upgraded devices are back online." << std::endl;
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    std::cout << "Some devices have not reconnected yet, using pre-upgrade version for those." << std::endl;
+}
+
 void printSummary(std::vector<DeviceUpgradeContext> &totalDevices)
 {
     std::vector<DeviceUpgradeContext*> successDevices;
@@ -422,18 +417,17 @@ void printSummary(std::vector<DeviceUpgradeContext> &totalDevices)
 
     for (auto &ctx : totalDevices)
     {
-        if (ctx.finalSuccess)
+        if (ctx.result == UpgradeResult::Success)
         {
             successDevices.push_back(&ctx);
         }
-        else
+        else if (ctx.result == UpgradeResult::Failure)
         {
             failedDevices.push_back(&ctx);
         }
     }
 
-    waitForDevicesReconnection(successDevices);
-    updateDeviceInfoFromOnlineMap(totalDevices);
+    waitForDevicesReconnection(totalDevices);
 
     std::cout << "\nUpgrade Summary:" << std::endl;
     std::cout << "==================================================" << std::endl;
@@ -478,7 +472,7 @@ bool upgradeSingleDeviceWindows(const std::string &filePath, DeviceUpgradeContex
         if (itr == pipelineHolderMap.end())
         {
             ctx.errorMsg = "Device disconnected before upgrade";
-            ctx.finalFailure = true;
+            ctx.result = UpgradeResult::Failure;
             return false;
         }
         pipeline = itr->second->pipeline;
@@ -487,7 +481,7 @@ bool upgradeSingleDeviceWindows(const std::string &filePath, DeviceUpgradeContex
     if (!pipeline)
     {
         ctx.errorMsg = "Invalid pipeline";
-        ctx.finalFailure = true;
+        ctx.result = UpgradeResult::Failure;
         return false;
     }
 
@@ -502,7 +496,7 @@ bool upgradeSingleDeviceWindows(const std::string &filePath, DeviceUpgradeContex
         else
         {
             ctx.errorMsg = "Device does not support recovery mode";
-            ctx.finalFailure = true;
+            ctx.result = UpgradeResult::Failure;
             return false;
         }
     }
@@ -557,7 +551,7 @@ bool upgradeSingleDeviceWindows(const std::string &filePath, DeviceUpgradeContex
     if (!found)
     {
         ctx.errorMsg = "Device did not enter recovery mode within timeout";
-        ctx.finalFailure = true;
+        ctx.result = UpgradeResult::Failure;
         return false;
     }
 
@@ -570,14 +564,14 @@ bool upgradeSingleDeviceWindows(const std::string &filePath, DeviceUpgradeContex
     if (status == -1 && cmdOutput.empty())
     {
         ctx.errorMsg = "Failed to execute USBDownloadTool.exe or process creation failed";
-        ctx.finalFailure = true;
+        ctx.result = UpgradeResult::Failure;
         return false;
     }
 
     if (status != 0)
     {
         ctx.errorMsg = "Firmware upgrade tool returned error code: " + std::to_string(status);
-        ctx.finalFailure = true;
+        ctx.result = UpgradeResult::Failure;
         return false;
     }
 
@@ -586,17 +580,17 @@ bool upgradeSingleDeviceWindows(const std::string &filePath, DeviceUpgradeContex
     if (cmdOutput.find("open script fail") != std::string::npos)
     {
         ctx.errorMsg = "Firmware upgrade failed: script not found (check firmware path)";
-        ctx.finalFailure = true;
+        ctx.result = UpgradeResult::Failure;
         return false;
     }
     if (cmdOutput.find("load fail") != std::string::npos)
     {
         ctx.errorMsg = "Firmware upgrade failed: one or more firmware files failed to load";
-        ctx.finalFailure = true;
+        ctx.result = UpgradeResult::Failure;
         return false;
     }
 
-    ctx.finalSuccess = true;
+    ctx.result = UpgradeResult::Success;
     return true;
 }
 
@@ -635,7 +629,7 @@ void upgradeRecoveryDevicesWindows(const std::string &filePath, std::vector<Devi
             if (status == -1 && cmdOutput.empty())
             {
                 ctx.errorMsg = "Failed to execute USBDownloadTool.exe or process creation failed";
-                ctx.finalFailure = true;
+                ctx.result = UpgradeResult::Failure;
                 totalDevices.push_back(ctx);
                 continue;
             }
@@ -643,21 +637,21 @@ void upgradeRecoveryDevicesWindows(const std::string &filePath, std::vector<Devi
             if (status != 0)
             {
                 ctx.errorMsg = "Firmware upgrade tool returned error code: " + std::to_string(status);
-                ctx.finalFailure = true;
+                ctx.result = UpgradeResult::Failure;
             }
             else if (cmdOutput.find("open script fail") != std::string::npos)
             {
                 ctx.errorMsg = "Firmware upgrade failed: script not found (check firmware path)";
-                ctx.finalFailure = true;
+                ctx.result = UpgradeResult::Failure;
             }
             else if (cmdOutput.find("load fail") != std::string::npos)
             {
                 ctx.errorMsg = "Firmware upgrade failed: one or more firmware files failed to load";
-                ctx.finalFailure = true;
+                ctx.result = UpgradeResult::Failure;
             }
             else
             {
-                ctx.finalSuccess = true;
+                ctx.result = UpgradeResult::Success;
             }
             totalDevices.push_back(ctx);
         }
@@ -870,7 +864,7 @@ bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext 
         if (itr == pipelineHolderMap.end())
         {
             ctx.errorMsg = "Device disconnected before upgrade";
-            ctx.finalFailure = true;
+            ctx.result = UpgradeResult::Failure;
             return false;
         }
         pipeline = itr->second->pipeline;
@@ -879,7 +873,7 @@ bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext 
     if (!pipeline)
     {
         ctx.errorMsg = "Invalid pipeline";
-        ctx.finalFailure = true;
+        ctx.result = UpgradeResult::Failure;
         return false;
     }
 
@@ -894,7 +888,7 @@ bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext 
         else
         {
             ctx.errorMsg = "Device does not support recovery mode";
-            ctx.finalFailure = true;
+            ctx.result = UpgradeResult::Failure;
             return false;
         }
     }
@@ -936,50 +930,46 @@ bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext 
         }
     }
 
-    // 2. Wait for the device to enter recovery mode
-    // Wait 10 seconds for the device to reboot
-    std::this_thread::sleep_for(std::chrono::seconds(10));
-
-    // 3. Scan for SCSI generic devices, skipping already upgraded ones and other pre-existing recovery devices
+    // 2. Poll for the device to appear in recovery mode (up to 30 seconds)
     const std::string devDir = "/dev/";
     const std::vector<std::string> devPrefixes = {"sg", "sd"};
 
-    DIR *dir = opendir(devDir.c_str());
-    if (dir == nullptr)
-    {
-        ctx.errorMsg = "Failed to open /dev directory";
-        ctx.finalFailure = true;
-        return false;
-    }
-
     std::string targetPath;
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != nullptr)
+    for (int retry = 0; retry < 60; ++retry)
     {
-        std::string filename(entry->d_name);
-        for (const auto &prefix : devPrefixes)
+        DIR *dir = opendir(devDir.c_str());
+        if (dir)
         {
-            if (filename.compare(0, prefix.size(), prefix) == 0)
+            struct dirent *entry;
+            while ((entry = readdir(dir)) != nullptr)
             {
-                std::string devicePath = devDir + filename;
-                if (usedDevicePaths.find(devicePath) == usedDevicePaths.end() &&
-                    otherRecoveryDevices.find(devicePath) == otherRecoveryDevices.end() &&
-                    isFemtoBoltRecoveryDevice(devicePath))
+                std::string filename(entry->d_name);
+                for (const auto &prefix : devPrefixes)
                 {
-                    targetPath = devicePath;
-                    break;
+                    if (filename.compare(0, prefix.size(), prefix) == 0)
+                    {
+                        std::string devicePath = devDir + filename;
+                        if (usedDevicePaths.find(devicePath) == usedDevicePaths.end() &&
+                            otherRecoveryDevices.find(devicePath) == otherRecoveryDevices.end() &&
+                            isFemtoBoltRecoveryDevice(devicePath))
+                        {
+                            targetPath = devicePath;
+                            break;
+                        }
+                    }
                 }
+                if (!targetPath.empty()) break;
             }
+            closedir(dir);
         }
-        if (!targetPath.empty())
-            break;
+        if (!targetPath.empty()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
-    closedir(dir);
 
     if (targetPath.empty())
     {
         ctx.errorMsg = "No recovery device found";
-        ctx.finalFailure = true;
+        ctx.result = UpgradeResult::Failure;
         return false;
     }
 
@@ -995,30 +985,37 @@ bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext 
     if (status == -1 && cmdOutput.empty())
     {
         ctx.errorMsg = "Failed to execute usbdownload or process creation failed";
-        ctx.finalFailure = true;
+        ctx.result = UpgradeResult::Failure;
         return false;
     }
 
     if (status != 0)
     {
         ctx.errorMsg = "Firmware upgrade tool returned error code: " + std::to_string(status);
-        ctx.finalFailure = true;
+        ctx.result = UpgradeResult::Failure;
         return false;
     }
 
     // usbdownload may return 0 even when errors occurred (e.g. permission denied, RDONLY).
     // Check output for known failure keywords.
-    if (cmdOutput.find("RDONLY") != std::string::npos ||
-        cmdOutput.find("error") != std::string::npos ||
-        cmdOutput.find("load fail") != std::string::npos ||
-        cmdOutput.find("open script fail") != std::string::npos)
+    std::string lowerOutput = cmdOutput;
+    std::transform(lowerOutput.begin(), lowerOutput.end(), lowerOutput.begin(), ::tolower);
+    bool hasFailure = false;
+    if (lowerOutput.find("rdonly") != std::string::npos) hasFailure = true;
+    if (lowerOutput.find("load fail") != std::string::npos) hasFailure = true;
+    if (lowerOutput.find("open script fail") != std::string::npos) hasFailure = true;
+    // Only treat generic "error" as a failure if the output does not explicitly say "no error".
+    if (lowerOutput.find("error") != std::string::npos && lowerOutput.find("no error") == std::string::npos)
+        hasFailure = true;
+
+    if (hasFailure)
     {
         ctx.errorMsg = "Firmware upgrade failed: device I/O error or permission denied (try sudo)";
-        ctx.finalFailure = true;
+        ctx.result = UpgradeResult::Failure;
         return false;
     }
 
-    ctx.finalSuccess = true;
+    ctx.result = UpgradeResult::Success;
     return true;
 }
 
@@ -1026,39 +1023,39 @@ void upgradeRecoveryDevicesLinux(const std::string &filePath, std::vector<Device
 {
     std::cout << "Scanning for recovery mode devices..." << std::endl;
 
-    // Wait for devices to appear in recovery mode
-    std::this_thread::sleep_for(std::chrono::seconds(10));
-
     const std::string devDir = "/dev/";
     const std::vector<std::string> devPrefixes = {"sg", "sd"};
 
-    DIR *dir = opendir(devDir.c_str());
-    if (dir == nullptr)
-    {
-        std::cerr << "Failed to open /dev directory" << std::endl;
-        return;
-    }
-
+    // Poll for recovery devices to appear (up to 20 seconds = 40 * 500ms)
     std::vector<std::string> devicePaths;
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != nullptr)
+    for (int retry = 0; retry < 40; ++retry)
     {
-        std::string filename(entry->d_name);
-        for (const auto &prefix : devPrefixes)
+        DIR *dir = opendir(devDir.c_str());
+        if (dir)
         {
-            if (filename.compare(0, prefix.size(), prefix) == 0)
+            struct dirent *entry;
+            while ((entry = readdir(dir)) != nullptr)
             {
-                std::string devicePath = devDir + filename;
-                if (usedDevicePaths.find(devicePath) == usedDevicePaths.end() &&
-                    isFemtoBoltRecoveryDevice(devicePath))
+                std::string filename(entry->d_name);
+                for (const auto &prefix : devPrefixes)
                 {
-                    devicePaths.push_back(devicePath);
+                    if (filename.compare(0, prefix.size(), prefix) == 0)
+                    {
+                        std::string devicePath = devDir + filename;
+                        if (usedDevicePaths.find(devicePath) == usedDevicePaths.end() &&
+                            isFemtoBoltRecoveryDevice(devicePath))
+                        {
+                            devicePaths.push_back(devicePath);
+                        }
+                        break;
+                    }
                 }
-                break;
             }
+            closedir(dir);
         }
+        if (!devicePaths.empty()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
-    closedir(dir);
 
     if (devicePaths.empty())
     {
@@ -1087,7 +1084,7 @@ void upgradeRecoveryDevicesLinux(const std::string &filePath, std::vector<Device
         if (status == -1 && cmdOutput.empty())
         {
             ctx.errorMsg = "Failed to execute usbdownload or process creation failed";
-            ctx.finalFailure = true;
+            ctx.result = UpgradeResult::Failure;
             totalDevices.push_back(ctx);
             continue;
         }
@@ -1095,19 +1092,28 @@ void upgradeRecoveryDevicesLinux(const std::string &filePath, std::vector<Device
         if (status != 0)
         {
             ctx.errorMsg = "Firmware upgrade tool returned error code: " + std::to_string(status);
-            ctx.finalFailure = true;
-        }
-        else if (cmdOutput.find("RDONLY") != std::string::npos ||
-                 cmdOutput.find("error") != std::string::npos ||
-                 cmdOutput.find("load fail") != std::string::npos ||
-                 cmdOutput.find("open script fail") != std::string::npos)
-        {
-            ctx.errorMsg = "Firmware upgrade failed: device I/O error or permission denied (try sudo)";
-            ctx.finalFailure = true;
+            ctx.result = UpgradeResult::Failure;
         }
         else
         {
-            ctx.finalSuccess = true;
+            std::string lowerOutput = cmdOutput;
+            std::transform(lowerOutput.begin(), lowerOutput.end(), lowerOutput.begin(), ::tolower);
+            bool hasFailure = false;
+            if (lowerOutput.find("rdonly") != std::string::npos) hasFailure = true;
+            if (lowerOutput.find("load fail") != std::string::npos) hasFailure = true;
+            if (lowerOutput.find("open script fail") != std::string::npos) hasFailure = true;
+            if (lowerOutput.find("error") != std::string::npos && lowerOutput.find("no error") == std::string::npos)
+                hasFailure = true;
+
+            if (hasFailure)
+            {
+                ctx.errorMsg = "Firmware upgrade failed: device I/O error or permission denied (try sudo)";
+                ctx.result = UpgradeResult::Failure;
+            }
+            else
+            {
+                ctx.result = UpgradeResult::Success;
+            }
         }
         totalDevices.push_back(ctx);
     }
