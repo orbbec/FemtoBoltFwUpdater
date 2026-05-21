@@ -1066,6 +1066,15 @@ void upgradeRecoveryDevicesLinux(const std::string &filePath, std::vector<Device
     int deviceIndex = 0;
     for (const auto &path : devicePaths)
     {
+        // Re-verify the device is still a valid recovery device before flashing.
+        // After a prior device was flashed and rebooted, its sg/sd node may
+        // linger momentarily. Calling usbdownload on a stale node produces
+        // "open /dev/sg*(RDWR) error" which would be misreported as a failure.
+        if (!isFemtoBoltRecoveryDevice(path)) {
+            std::cout << "  Recovery device " << path << " no longer available, skipping." << std::endl;
+            continue;
+        }
+
         usedDevicePaths.insert(path);
         deviceIndex++;
 
