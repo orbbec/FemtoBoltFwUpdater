@@ -870,7 +870,7 @@ static std::vector<std::string> findRecoveryDevices(const std::set<std::string> 
     const std::string devDir = "/dev/";
     DIR *dir = opendir(devDir.c_str());
     if (!dir) {
-        std::cerr << "  [diag] Cannot open " << devDir << std::endl;
+        std::cerr << "  Cannot open " << devDir << std::endl;
         return result;
     }
 
@@ -957,7 +957,7 @@ bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext 
     scanExclude.insert(otherRecoveryDevices.begin(), otherRecoveryDevices.end());
 
     if (!otherRecoveryDevices.empty()) {
-        std::cout << "  [diag] Excluding " << otherRecoveryDevices.size()
+        std::cout << "  Excluding " << otherRecoveryDevices.size()
                   << " pre-existing recovery device(s) from scan" << std::endl;
     }
 
@@ -978,8 +978,6 @@ bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext 
 
     if (targetPath.empty())
     {
-        std::cerr << "  [diag] No recovery device appeared within timeout." << std::endl;
-        std::cerr << "  [diag] Check: ls /dev/sd* /dev/sg* ; cat /sys/block/sd*/device/vendor /sys/class/scsi_generic/sg*/device/vendor" << std::endl;
         ctx.errorMsg = "No recovery device found";
         ctx.result = UpgradeResult::Failure;
         return false;
@@ -1051,25 +1049,17 @@ void upgradeRecoveryDevicesLinux(const std::string &filePath, std::vector<Device
 {
     std::cout << "Scanning for recovery mode devices..." << std::endl;
 
-    // Poll for recovery devices to appear (up to 60 seconds = 120 * 500ms)
+    // Quick scan for remaining recovery devices (up to 5 seconds).
     std::vector<std::string> devicePaths;
-    for (int retry = 0; retry < 120; ++retry)
+    for (int retry = 0; retry < 10; ++retry)
     {
         devicePaths = findRecoveryDevices(usedDevicePaths);
         if (!devicePaths.empty()) break;
-        if (retry > 0 && retry % 20 == 0) {
-            std::cout << "  Still scanning for recovery devices... (" << retry / 2 << "s)" << std::endl;
-        }
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
     if (devicePaths.empty())
-    {
-        std::cerr << "No recovery mode device found." << std::endl;
-        std::cerr << "  [diag] Check: ls /dev/sd* /dev/sg* ; cat /sys/block/sd*/device/vendor /sys/class/scsi_generic/sg*/device/vendor" << std::endl;
-        std::cerr << "  [diag] If no sg* devices exist, try: sudo modprobe sg" << std::endl;
         return;
-    }
 
     int deviceIndex = 0;
     for (const auto &path : devicePaths)
