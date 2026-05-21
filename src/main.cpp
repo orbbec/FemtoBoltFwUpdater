@@ -232,6 +232,16 @@ catch (ob::Error &e)
     std::cerr << "function:" << e.getName() << "\nargs:" << e.getArgs() << "\nmessage:" << e.getMessage() << "\ntype:" << e.getExceptionType() << std::endl;
     exit(EXIT_FAILURE);
 }
+catch (const std::exception &e)
+{
+    std::cerr << "Unhandled exception: " << e.what() << std::endl;
+    exit(EXIT_FAILURE);
+}
+catch (...)
+{
+    std::cerr << "Unknown fatal error occurred." << std::endl;
+    exit(EXIT_FAILURE);
+}
 
 /**
  * Handle current connected devices.
@@ -326,17 +336,9 @@ void printDevicesInfo()
     }
 }
 
-static std::string getLatestFirmwareVersionBySN(const std::string &serialNumber)
+static bool isValidSerialNumber(const std::string &sn)
 {
-    std::lock_guard<std::recursive_mutex> lk(pipelineHolderMutex);
-    for (const auto &iter : pipelineHolderMap)
-    {
-        if (iter.second->deviceInfo && iter.second->deviceInfo->serialNumber() == serialNumber)
-        {
-            return iter.second->deviceInfo->firmwareVersion();
-        }
-    }
-    return "";
+    return !sn.empty() && sn != "Unknown" && sn != "CL000000000";
 }
 
 static void updateDeviceInfoFromOnlineMap(std::vector<DeviceUpgradeContext> &totalDevices)
@@ -348,7 +350,7 @@ static void updateDeviceInfoFromOnlineMap(std::vector<DeviceUpgradeContext> &tot
         if (ctx.result != UpgradeResult::Success) continue;
 
         // Try to match by serial number first
-        if (ctx.serialNumber != "Unknown")
+        if (isValidSerialNumber(ctx.serialNumber))
         {
             for (const auto &iter : pipelineHolderMap)
             {
@@ -363,12 +365,13 @@ static void updateDeviceInfoFromOnlineMap(std::vector<DeviceUpgradeContext> &tot
         }
         else
         {
-            // Recovery mode device: match any unassigned online device
+            // Recovery mode device: match any unassigned online device with a valid SN
             for (const auto &iter : pipelineHolderMap)
             {
                 if (assignedUIDs.find(iter.first) != assignedUIDs.end())
                     continue;
-                if (iter.second->deviceInfo)
+                if (iter.second->deviceInfo &&
+                    isValidSerialNumber(iter.second->deviceInfo->serialNumber()))
                 {
                     ctx.serialNumber = iter.second->deviceInfo->serialNumber();
                     ctx.firmwareVersion = iter.second->deviceInfo->firmwareVersion();
@@ -399,7 +402,7 @@ static void waitForDevicesReconnection(std::vector<DeviceUpgradeContext> &totalD
         bool allResolved = true;
         for (const auto *ctx : successDevices)
         {
-            if (ctx->serialNumber == "Unknown" || ctx->firmwareVersion.empty())
+            if (!isValidSerialNumber(ctx->serialNumber) || ctx->firmwareVersion.empty())
             {
                 allResolved = false;
                 break;
@@ -421,6 +424,10 @@ static void rebootAllSuccessDevices(const std::vector<DeviceUpgradeContext> &tot
     for (const auto &ctx : totalDevices)
     {
         if (ctx.result != UpgradeResult::Success)
+            continue;
+
+        // Skip devices that already reconnected with a valid serial number and firmware version.
+        if (isValidSerialNumber(ctx.serialNumber) && !ctx.firmwareVersion.empty())
             continue;
 
         // Find the online device by serial number so we can issue a reboot command.
@@ -780,6 +787,8 @@ int runCommandWithTimeout(const std::string &cmd, std::string &output, DWORD tim
             // Print output in real time so the user knows the upgrade is progressing
             std::cout << buf << std::flush;
         }
+        // ReadFile returns FALSE when the pipe is closed (ERROR_BROKEN_PIPE) or on error.
+        // A broken pipe is expected when the child process exits; any other error is benign here.
     });
 
     DWORD waitResult = WaitForSingleObject(pi.hProcess, timeoutMs);
@@ -846,7 +855,16 @@ int runCommandWithTimeoutLinux(const std::string &cmd, std::string &output, int 
 
     while (true) {
         pid_t result = waitpid(pid, &status, WNOHANG);
-        if (result == -1) break;
+        if (result == -1) {
+            // Child may have been reaped or interrupted; drain remaining output before giving up.
+            ssize_t n;
+            while ((n = read(stdoutPipe[0], buf, sizeof(buf) - 1)) > 0) {
+                buf[n] = '\0';
+                output += buf;
+                std::cout << buf << std::flush;
+            }
+            break;
+        }
 
         if (result == pid) {
             processExited = true;
@@ -898,24 +916,41 @@ int runCommandWithTimeoutLinux(const std::string &cmd, std::string &output, int 
 
 static bool isFemtoBoltRecoveryDevice(const std::string &devicePath)
 {
-    // devicePath is like "/dev/sg1" or "/dev/sdb"
+    // Only /dev/sg* supports SCSI PASS THROUGH, which usbdownload requires.
     size_t pos = devicePath.rfind('/');
     if (pos == std::string::npos) return false;
     std::string devName = devicePath.substr(pos + 1);
+    if (devName.compare(0, 2, "sg") != 0) return false;
 
-    // Try scsi_generic sysfs first (for /dev/sg*)
     std::string vendorPath = "/sys/class/scsi_generic/" + devName + "/device/vendor";
     std::ifstream fs(vendorPath);
-    if (!fs) {
-        // Fallback: try scsi_disk sysfs (for /dev/sd*)
-        vendorPath = "/sys/class/scsi_disk/" + devName + "/device/vendor";
-        fs.open(vendorPath);
-        if (!fs) return false;
-    }
+    if (!fs) return false;
 
     std::string vendor;
     fs >> vendor;
     return (vendor.size() >= 2 && vendor[0] == 'G' && vendor[1] == 'C');
+}
+
+static std::vector<std::string> findRecoveryDevices(const std::set<std::string> &exclude)
+{
+    std::vector<std::string> result;
+    const std::string devDir = "/dev/";
+    DIR *dir = opendir(devDir.c_str());
+    if (!dir) return result;
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        std::string filename(entry->d_name);
+        if (filename.compare(0, 2, "sg") == 0) {
+            std::string devicePath = devDir + filename;
+            if (exclude.find(devicePath) == exclude.end() &&
+                isFemtoBoltRecoveryDevice(devicePath)) {
+                result.push_back(devicePath);
+            }
+        }
+    }
+    closedir(dir);
+    return result;
 }
 
 bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext &ctx, std::set<std::string> &usedDevicePaths)
@@ -973,61 +1008,24 @@ bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext 
     // so we don't accidentally pick them up instead of the device we just rebooted.
     std::set<std::string> otherRecoveryDevices;
     {
-        const std::string devDir = "/dev/";
-        const std::vector<std::string> devPrefixes = {"sg", "sd"};
-        DIR *dir = opendir(devDir.c_str());
-        if (dir) {
-            struct dirent *entry;
-            while ((entry = readdir(dir)) != nullptr) {
-                std::string filename(entry->d_name);
-                for (const auto &prefix : devPrefixes) {
-                    if (filename.compare(0, prefix.size(), prefix) == 0) {
-                        std::string devicePath = devDir + filename;
-                        if (usedDevicePaths.find(devicePath) == usedDevicePaths.end() &&
-                            isFemtoBoltRecoveryDevice(devicePath)) {
-                            otherRecoveryDevices.insert(devicePath);
-                        }
-                        break;
-                    }
-                }
-            }
-            closedir(dir);
+        auto devices = findRecoveryDevices(usedDevicePaths);
+        for (const auto &path : devices) {
+            otherRecoveryDevices.insert(path);
         }
     }
 
     // 2. Poll for the device to appear in recovery mode (up to 30 seconds)
-    const std::string devDir = "/dev/";
-    const std::vector<std::string> devPrefixes = {"sg", "sd"};
+    std::set<std::string> scanExclude = usedDevicePaths;
+    scanExclude.insert(otherRecoveryDevices.begin(), otherRecoveryDevices.end());
 
     std::string targetPath;
     for (int retry = 0; retry < 60; ++retry)
     {
-        DIR *dir = opendir(devDir.c_str());
-        if (dir)
-        {
-            struct dirent *entry;
-            while ((entry = readdir(dir)) != nullptr)
-            {
-                std::string filename(entry->d_name);
-                for (const auto &prefix : devPrefixes)
-                {
-                    if (filename.compare(0, prefix.size(), prefix) == 0)
-                    {
-                        std::string devicePath = devDir + filename;
-                        if (usedDevicePaths.find(devicePath) == usedDevicePaths.end() &&
-                            otherRecoveryDevices.find(devicePath) == otherRecoveryDevices.end() &&
-                            isFemtoBoltRecoveryDevice(devicePath))
-                        {
-                            targetPath = devicePath;
-                            break;
-                        }
-                    }
-                }
-                if (!targetPath.empty()) break;
-            }
-            closedir(dir);
+        auto devices = findRecoveryDevices(scanExclude);
+        if (!devices.empty()) {
+            targetPath = devices.front();
+            break;
         }
-        if (!targetPath.empty()) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
@@ -1100,36 +1098,11 @@ void upgradeRecoveryDevicesLinux(const std::string &filePath, std::vector<Device
 {
     std::cout << "Scanning for recovery mode devices..." << std::endl;
 
-    const std::string devDir = "/dev/";
-    const std::vector<std::string> devPrefixes = {"sg", "sd"};
-
     // Poll for recovery devices to appear (up to 20 seconds = 40 * 500ms)
     std::vector<std::string> devicePaths;
     for (int retry = 0; retry < 40; ++retry)
     {
-        DIR *dir = opendir(devDir.c_str());
-        if (dir)
-        {
-            struct dirent *entry;
-            while ((entry = readdir(dir)) != nullptr)
-            {
-                std::string filename(entry->d_name);
-                for (const auto &prefix : devPrefixes)
-                {
-                    if (filename.compare(0, prefix.size(), prefix) == 0)
-                    {
-                        std::string devicePath = devDir + filename;
-                        if (usedDevicePaths.find(devicePath) == usedDevicePaths.end() &&
-                            isFemtoBoltRecoveryDevice(devicePath))
-                        {
-                            devicePaths.push_back(devicePath);
-                        }
-                        break;
-                    }
-                }
-            }
-            closedir(dir);
-        }
+        devicePaths = findRecoveryDevices(usedDevicePaths);
         if (!devicePaths.empty()) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }

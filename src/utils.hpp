@@ -26,10 +26,7 @@ int getch(void) {
     }
 
     ch = getchar();
-    if(tcsetattr(fd, TCSANOW, &tm_old) < 0) {  // Change the settings to what they were originally
-        return -1;
-    }
-
+    tcsetattr(fd, TCSANOW, &tm_old);       // Always restore settings even if getchar fails
     return ch;
 }
 
@@ -37,14 +34,14 @@ int kbhit(void) {
     struct termios oldt, newt;
     int            ch;
     int            oldf;
-    tcgetattr(STDIN_FILENO, &oldt);
+    if(tcgetattr(STDIN_FILENO, &oldt) < 0) return 0;
     newt = oldt;
     newt.c_lflag &= ~(ICANON | ECHO);
-    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+    if(tcsetattr(STDIN_FILENO, TCSANOW, &newt) < 0) return 0;
     oldf = fcntl(STDIN_FILENO, F_GETFL, 0);
     fcntl(STDIN_FILENO, F_SETFL, oldf | O_NONBLOCK);
     ch = getchar();
-    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);  // Always restore
     fcntl(STDIN_FILENO, F_SETFL, oldf);
     if(ch != EOF) {
         ungetc(ch, stdin);
