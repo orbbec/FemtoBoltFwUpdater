@@ -118,13 +118,17 @@ void upgradeRecoveryDevicesLinux(const std::string &filePath, std::vector<Device
 int main(int argc, char **argv)
 try
 {
-    if (argc != 2)
+    if (argc < 2 || argc > 3)
     {
-        std::cerr << "Usage:[app] [firmware path]" << std::endl;
+        std::cerr << "Usage:[app] [firmware path] [--auto]" << std::endl;
         return -1;
     }
 
     std::string filePath = normalizeFirmwarePath(argv[1]);
+
+    // Non-interactive mode: auto-confirm prompts, no key press required.
+    bool autoMode = (argc >= 3 && std::string(argv[2]) == "--auto");
+
     // create context
     ob::Context ctx;
 
@@ -170,17 +174,24 @@ try
         std::cout << "\nNo normal mode device found. Will attempt to find recovery mode devices." << std::endl;
         std::cout << "Press 'U' or 'u' to start scanning recovery devices, or Esc to exit." << std::endl;
     }
-    while (true)
+    if (!autoMode)
     {
-        int key = waitForKeyPress();
-        if (key == ESC)
+        while (true)
         {
-            return 0;
+            int key = waitForKeyPress();
+            if (key == ESC)
+            {
+                return 0;
+            }
+            if (key == 'u' || key == 'U')
+            {
+                break;
+            }
         }
-        if (key == 'u' || key == 'U')
-        {
-            break;
-        }
+    }
+    else
+    {
+        std::cout << "[Auto mode] Starting upgrade automatically..." << std::endl;
     }
 
     std::cout << "\nStarting firmware upgrade..." << std::endl;
@@ -221,8 +232,11 @@ try
 
     printSummary(totalDevices);
 
-    std::cout << "\nPress any key to exit..." << std::endl;
-    waitForKeyPress();
+    if (!autoMode)
+    {
+        std::cout << "\nPress any key to exit..." << std::endl;
+        waitForKeyPress();
+    }
 
     return 0;
 }
