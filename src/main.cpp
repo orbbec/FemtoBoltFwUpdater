@@ -28,7 +28,6 @@
 
 struct PipelineHolder
 {
-    std::shared_ptr<ob::Pipeline> pipeline;
     std::shared_ptr<ob::DeviceInfo> deviceInfo;
 };
 
@@ -107,12 +106,12 @@ static int waitForKeyPress()
 #endif
 
 #ifdef WIN32
-bool upgradeSingleDeviceWindows(const std::string &filePath, DeviceUpgradeContext &ctx, std::set<int> &usedDiskSet);
-void upgradeRecoveryDevicesWindows(const std::string &filePath, std::vector<DeviceUpgradeContext> &totalDevices, std::set<int> &usedDiskSet);
+bool upgradeSingleDeviceWindows(ob::Context &sdkCtx, const std::string &filePath, DeviceUpgradeContext &ctx, std::set<int> &usedDiskSet);
+void upgradeRecoveryDevicesWindows(ob::Context &sdkCtx, const std::string &filePath, std::vector<DeviceUpgradeContext> &totalDevices, std::set<int> &usedDiskSet);
 int runCommandWithTimeout(const std::string &cmd, std::string &output, DWORD timeoutMs);
 #else
-bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext &ctx, std::set<std::string> &usedDevicePaths);
-void upgradeRecoveryDevicesLinux(const std::string &filePath, std::vector<DeviceUpgradeContext> &totalDevices, std::set<std::string> &usedDevicePaths);
+bool upgradeSingleDeviceLinux(ob::Context &sdkCtx, const std::string &filePath, DeviceUpgradeContext &ctx, std::set<std::string> &usedDevicePaths);
+void upgradeRecoveryDevicesLinux(ob::Context &sdkCtx, const std::string &filePath, std::vector<DeviceUpgradeContext> &totalDevices, std::set<std::string> &usedDevicePaths);
 #endif
 
 int main(int argc, char **argv)
@@ -202,28 +201,28 @@ try
     {
         std::cout << "\nUpgrading device: " << (i + 1) << "/" << totalDevices.size()
                   << " - " << totalDevices[i].name << " | SN: " << totalDevices[i].serialNumber << std::endl;
-        if (!upgradeSingleDeviceWindows(filePath, totalDevices[i], usedDiskSet))
+        if (!upgradeSingleDeviceWindows(ctx, filePath, totalDevices[i], usedDiskSet))
         {
             std::cerr << "Failed to upgrade device: " << totalDevices[i].serialNumber
                       << " - " << totalDevices[i].errorMsg << std::endl;
         }
     }
     // After normal devices, scan for any remaining recovery mode devices
-    upgradeRecoveryDevicesWindows(filePath, totalDevices, usedDiskSet);
+    upgradeRecoveryDevicesWindows(ctx, filePath, totalDevices, usedDiskSet);
 #else
     std::set<std::string> usedDevicePaths;
     for (size_t i = 0; i < totalDevices.size(); ++i)
     {
         std::cout << "\nUpgrading device: " << (i + 1) << "/" << totalDevices.size()
                   << " - " << totalDevices[i].name << " | SN: " << totalDevices[i].serialNumber << std::endl;
-        if (!upgradeSingleDeviceLinux(filePath, totalDevices[i], usedDevicePaths))
+        if (!upgradeSingleDeviceLinux(ctx, filePath, totalDevices[i], usedDevicePaths))
         {
             std::cerr << "Failed to upgrade device: " << totalDevices[i].serialNumber
                       << " - " << totalDevices[i].errorMsg << std::endl;
         }
     }
     // After normal devices, scan for any remaining recovery mode devices
-    upgradeRecoveryDevicesLinux(filePath, totalDevices, usedDevicePaths);
+    upgradeRecoveryDevicesLinux(ctx, filePath, totalDevices, usedDevicePaths);
 #endif
 
     // Suppress further device connect/disconnect logs before printing Summary
@@ -287,9 +286,7 @@ void handleDeviceConnected(std::shared_ptr<ob::DeviceList> connectList)
         {
             auto device = connectList->getDevice(i);
             auto deviceInfo = device->getDeviceInfo();
-            auto pipeline = std::make_shared<ob::Pipeline>(device);
             auto holder = std::make_shared<PipelineHolder>();
-            holder->pipeline = pipeline;
             holder->deviceInfo = deviceInfo;
             // Adds the new PipelineHolder to the pipelineHolderMap.
             pipelineHolderMap.insert({uid, holder});
@@ -402,33 +399,31 @@ static bool waitForNewDevice(const std::set<std::string> &excludeUIDs, int timeo
     return false;
 }
 
-static void rebootDeviceBySN(const std::string &sn)
+static void rebootDeviceBySN(ob::Context &sdkCtx, const std::string &sn)
 {
-    std::lock_guard<std::recursive_mutex> lk(pipelineHolderMutex);
-    for (const auto &iter : pipelineHolderMap) {
-        auto di = iter.second->deviceInfo;
-        if (di && di->serialNumber() == sn) {
-            try {
-                auto device = iter.second->pipeline->getDevice();
-                if (device) {
-                    std::cout << "Rebooting device: " << sn << "..." << std::endl;
-                    device->reboot();
-                }
+    try {
+        auto devList = sdkCtx.queryDeviceList();
+        for (uint32_t i = 0; i < devList->deviceCount(); ++i) {
+            auto device = devList->getDevice(i);
+            auto di = device->getDeviceInfo();
+            if (di && di->serialNumber() == sn) {
+                std::cout << "Rebooting device: " << sn << "..." << std::endl;
+                device->reboot();
+                break;
             }
-            catch (const ob::Error &e) {
-                std::cout << "Device " << sn
-                          << " may have rebooted (" << e.getMessage() << ")" << std::endl;
-            }
-            catch (const std::exception &e) {
-                std::cerr << "Failed to reboot device " << sn
-                          << ": " << e.what() << std::endl;
-            }
-            break;
         }
+    }
+    catch (const ob::Error &e) {
+        std::cout << "Device " << sn
+                  << " may have rebooted (" << e.getMessage() << ")" << std::endl;
+    }
+    catch (const std::exception &e) {
+        std::cerr << "Failed to reboot device " << sn
+                  << ": " << e.what() << std::endl;
     }
 }
 
-static void finalizeDeviceAfterUpgrade(DeviceUpgradeContext &ctx, const std::set<std::string> &preFlashUIDs)
+static void finalizeDeviceAfterUpgrade(ob::Context &sdkCtx, DeviceUpgradeContext &ctx, const std::set<std::string> &preFlashUIDs)
 {
     if (ctx.result != UpgradeResult::Success) return;
 
@@ -453,7 +448,7 @@ static void finalizeDeviceAfterUpgrade(DeviceUpgradeContext &ctx, const std::set
     // Step 2: Always perform an active reboot to ensure the serial number stabilizes.
     std::cout << "Device reconnected (SN: " << ctx.serialNumber
               << "). Performing final reboot..." << std::endl;
-    rebootDeviceBySN(ctx.serialNumber);
+    rebootDeviceBySN(sdkCtx, ctx.serialNumber);
 
     // Step 3: Wait for device to come back after the explicit reboot.
     // Snapshot current UIDs so we can detect the newly reconnected device.
@@ -520,25 +515,43 @@ void printSummary(std::vector<DeviceUpgradeContext> &totalDevices)
 }
 
 #ifdef WIN32
-bool upgradeSingleDeviceWindows(const std::string &filePath, DeviceUpgradeContext &ctx, std::set<int> &usedDiskSet)
+bool upgradeSingleDeviceWindows(ob::Context &sdkCtx, const std::string &filePath, DeviceUpgradeContext &ctx, std::set<int> &usedDiskSet)
 {
-    // 1. Find the device in pipelineHolderMap and set it to recovery mode
-    std::shared_ptr<ob::Pipeline> pipeline;
+    // 1. Re-enumerate the target device and create a temporary Pipeline to set recovery mode.
+    std::shared_ptr<ob::Device> targetDevice;
     {
-        std::lock_guard<std::recursive_mutex> lk(pipelineHolderMutex);
-        auto itr = pipelineHolderMap.find(ctx.uid);
-        if (itr == pipelineHolderMap.end())
+        auto devList = sdkCtx.queryDeviceList();
+        for (uint32_t i = 0; i < devList->deviceCount(); ++i)
         {
-            ctx.errorMsg = "Device disconnected before upgrade";
-            ctx.result = UpgradeResult::Failure;
-            return false;
+            if (std::string(devList->uid(i)) == ctx.uid)
+            {
+                targetDevice = devList->getDevice(i);
+                break;
+            }
         }
-        pipeline = itr->second->pipeline;
     }
 
-    if (!pipeline)
+    if (!targetDevice)
     {
-        ctx.errorMsg = "Invalid pipeline";
+        ctx.errorMsg = "Device disconnected before upgrade";
+        ctx.result = UpgradeResult::Failure;
+        return false;
+    }
+
+    std::shared_ptr<ob::Pipeline> pipeline;
+    try
+    {
+        pipeline = std::make_shared<ob::Pipeline>(targetDevice);
+    }
+    catch (const std::exception &e)
+    {
+        ctx.errorMsg = std::string("Failed to initialize device pipeline: ") + e.what();
+        ctx.result = UpgradeResult::Failure;
+        return false;
+    }
+    catch (...)
+    {
+        ctx.errorMsg = "Failed to initialize device pipeline: unknown error";
         ctx.result = UpgradeResult::Failure;
         return false;
     }
@@ -663,11 +676,11 @@ bool upgradeSingleDeviceWindows(const std::string &filePath, DeviceUpgradeContex
     }
 
     ctx.result = UpgradeResult::Success;
-    finalizeDeviceAfterUpgrade(ctx, preFlashUIDs);
+    finalizeDeviceAfterUpgrade(sdkCtx, ctx, preFlashUIDs);
     return true;
 }
 
-void upgradeRecoveryDevicesWindows(const std::string &filePath, std::vector<DeviceUpgradeContext> &totalDevices, std::set<int> &usedDiskSet)
+void upgradeRecoveryDevicesWindows(ob::Context &sdkCtx, const std::string &filePath, std::vector<DeviceUpgradeContext> &totalDevices, std::set<int> &usedDiskSet)
 {
     std::cout << "Scanning for recovery mode devices..." << std::endl;
 
@@ -731,7 +744,7 @@ void upgradeRecoveryDevicesWindows(const std::string &filePath, std::vector<Devi
             }
             totalDevices.push_back(ctx);
             if (ctx.result == UpgradeResult::Success) {
-                finalizeDeviceAfterUpgrade(totalDevices.back(), preFlashUIDs);
+                finalizeDeviceAfterUpgrade(sdkCtx, totalDevices.back(), preFlashUIDs);
             }
         }
 
@@ -907,26 +920,43 @@ static std::vector<std::string> findRecoveryDevices(const std::set<std::string> 
     return result;
 }
 
-bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext &ctx, std::set<std::string> &usedDevicePaths)
+bool upgradeSingleDeviceLinux(ob::Context &sdkCtx, const std::string &filePath, DeviceUpgradeContext &ctx, std::set<std::string> &usedDevicePaths)
 {
-
-    // 1. Find the device in pipelineHolderMap and set it to recovery mode
-    std::shared_ptr<ob::Pipeline> pipeline;
+    // 1. Re-enumerate the target device and create a temporary Pipeline to set recovery mode.
+    std::shared_ptr<ob::Device> targetDevice;
     {
-        std::lock_guard<std::recursive_mutex> lk(pipelineHolderMutex);
-        auto itr = pipelineHolderMap.find(ctx.uid);
-        if (itr == pipelineHolderMap.end())
+        auto devList = sdkCtx.queryDeviceList();
+        for (uint32_t i = 0; i < devList->deviceCount(); ++i)
         {
-            ctx.errorMsg = "Device disconnected before upgrade";
-            ctx.result = UpgradeResult::Failure;
-            return false;
+            if (std::string(devList->uid(i)) == ctx.uid)
+            {
+                targetDevice = devList->getDevice(i);
+                break;
+            }
         }
-        pipeline = itr->second->pipeline;
     }
 
-    if (!pipeline)
+    if (!targetDevice)
     {
-        ctx.errorMsg = "Invalid pipeline";
+        ctx.errorMsg = "Device disconnected before upgrade";
+        ctx.result = UpgradeResult::Failure;
+        return false;
+    }
+
+    std::shared_ptr<ob::Pipeline> pipeline;
+    try
+    {
+        pipeline = std::make_shared<ob::Pipeline>(targetDevice);
+    }
+    catch (const std::exception &e)
+    {
+        ctx.errorMsg = std::string("Failed to initialize device pipeline: ") + e.what();
+        ctx.result = UpgradeResult::Failure;
+        return false;
+    }
+    catch (...)
+    {
+        ctx.errorMsg = "Failed to initialize device pipeline: unknown error";
         ctx.result = UpgradeResult::Failure;
         return false;
     }
@@ -1057,11 +1087,11 @@ bool upgradeSingleDeviceLinux(const std::string &filePath, DeviceUpgradeContext 
     }
 
     ctx.result = UpgradeResult::Success;
-    finalizeDeviceAfterUpgrade(ctx, preFlashUIDs);
+    finalizeDeviceAfterUpgrade(sdkCtx, ctx, preFlashUIDs);
     return true;
 }
 
-void upgradeRecoveryDevicesLinux(const std::string &filePath, std::vector<DeviceUpgradeContext> &totalDevices, std::set<std::string> &usedDevicePaths)
+void upgradeRecoveryDevicesLinux(ob::Context &sdkCtx, const std::string &filePath, std::vector<DeviceUpgradeContext> &totalDevices, std::set<std::string> &usedDevicePaths)
 {
     std::cout << "Scanning for recovery mode devices..." << std::endl;
 
@@ -1143,7 +1173,7 @@ void upgradeRecoveryDevicesLinux(const std::string &filePath, std::vector<Device
         }
         totalDevices.push_back(ctx);
         if (ctx.result == UpgradeResult::Success) {
-            finalizeDeviceAfterUpgrade(totalDevices.back(), preFlashUIDs);
+            finalizeDeviceAfterUpgrade(sdkCtx, totalDevices.back(), preFlashUIDs);
         }
     }
 }
