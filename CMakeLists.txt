@@ -41,9 +41,6 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${THIRD_PARTY_DIR}/usbscsicmd
 )
 
-# app source files
-target_sources(${PROJECT_NAME} PRIVATE ${SRC_DIR}/main.cpp)
-
 target_link_directories(${PROJECT_NAME} PRIVATE
     ${THIRD_PARTY_DIR}/OrbbecSDK/lib/${CURRENT_BUILD_COMPILER}/
 )
@@ -64,3 +61,50 @@ install(TARGETS ${PROJECT_NAME}
 	ARCHIVE DESTINATION lib)
 
 add_subdirectory(${THIRD_PARTY_DIR}/usbscsicmd/)
+
+# ------------------------------------------------------------------------------
+# Copy runtime dependencies after build
+# ------------------------------------------------------------------------------
+if(WIN32)
+    set(RELEASE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/Release/Windows)
+    set(RUNTIME_FILES
+        ${RELEASE_DIR}/OrbbecSDK.dll
+        ${RELEASE_DIR}/depthengine_2_0.dll
+        ${RELEASE_DIR}/AitUVCExtApi.dll
+        ${RELEASE_DIR}/USBDownloadTool.exe
+    )
+    foreach(f ${RUNTIME_FILES})
+        if(EXISTS ${f})
+            add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${f} $<TARGET_FILE_DIR:${PROJECT_NAME}>
+            )
+        else()
+            message(WARNING "Missing runtime dependency: ${f}")
+        endif()
+    endforeach()
+elseif(UNIX)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+        set(RELEASE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/Release/Arm64)
+    else()
+        set(RELEASE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/Release/Linux)
+    endif()
+    set(RUNTIME_FILES
+        ${RELEASE_DIR}/libOrbbecSDK.so
+        ${RELEASE_DIR}/libOrbbecSDK.so.1.9
+        ${RELEASE_DIR}/libOrbbecSDK.so.1.9.5
+        ${RELEASE_DIR}/libdepthengine.so
+        ${RELEASE_DIR}/libdepthengine.so.2.0
+        ${RELEASE_DIR}/usbdownload
+    )
+    foreach(f ${RUNTIME_FILES})
+        if(EXISTS ${f})
+            add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${f} $<TARGET_FILE_DIR:${PROJECT_NAME}>
+            )
+        else()
+            message(WARNING "Missing runtime dependency: ${f}")
+        endif()
+    endforeach()
+endif()

@@ -107,14 +107,12 @@ int USB_ScsiWrite(unsigned char *buf, int len, ULONG max_packet) {
             sub_cmd = SSTAR_SCSICMD_SUBCODE_DOWNLOAD_END;
         }
 
-    _USB_SEND_DATA:
-        if(ScsiCmdSend(SSTAR_SCSICMD_OPCODE, sub_cmd, SCSI_BULK_OUT, temp, buf + wlen)) {
+        while(ScsiCmdSend(SSTAR_SCSICMD_OPCODE, sub_cmd, SCSI_BULK_OUT, temp, buf + wlen)) {
             Sleep(100);
             if(ulTimeout++ >= 100) {
                 // log("Scsi write time out:%lu\n", ulTimeout);
                 return -1;
             }
-            goto _USB_SEND_DATA;
         }
         total -= temp;
         wlen += temp;
@@ -151,7 +149,7 @@ int USB_ScsiRunCmd(const char *cmd, int len) {
     BYTE  sub_cmd   = SSTAR_SCSICMD_SUBCODE_UFU_RUN_CMD;
     ULONG ulTimeout = 0;
 
-    if(ScsiCmdSend(SSTAR_SCSICMD_OPCODE, sub_cmd, SCSI_BULK_OUT, len, ( UCHAR * )cmd)) {
+    while(ScsiCmdSend(SSTAR_SCSICMD_OPCODE, sub_cmd, SCSI_BULK_OUT, len, ( UCHAR * )cmd)) {
         Sleep(500);
         if(ulTimeout++ >= 100) {
             // log("Scsi runcmd time out:%lu\n", ulTimeout);
@@ -165,7 +163,7 @@ int USB_ScsiLoadInfo(void *info, int len) {
     BYTE  sub_cmd   = SSTAR_SCSICMD_SUBCODE_UFU_LOADINFO;
     ULONG ulTimeout = 0;
 
-    if(ScsiCmdSend(SSTAR_SCSICMD_OPCODE, sub_cmd, SCSI_BULK_OUT, len, ( UCHAR * )info)) {
+    while(ScsiCmdSend(SSTAR_SCSICMD_OPCODE, sub_cmd, SCSI_BULK_OUT, len, ( UCHAR * )info)) {
         Sleep(500);
         if(ulTimeout++ >= 100) {
             // log("Scsi loadinfo time out:%lu\n", ulTimeout);
